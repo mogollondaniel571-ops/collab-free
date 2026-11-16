@@ -1,0 +1,25 @@
+{
+	"geode": "6.0.0-alpha.2",
+	"gd": {
+		"win": "2.2091"
+	},
+	"id": "daniel.collab-free",
+	"name": "Collab Free",
+	"version": "v1.0.0",
+	"developer": "Daniel",
+	"description": "Edita un nivel con hasta 5 amigos en tiempo real, gratis.",
+	"settings": {
+		"server-url": {
+			"type": "string",
+			"name": "Dirección del servidor",
+			"description": "La dirección de tu servidor de Render, por ejemplo https://collab-free.onrender.com. Todos tus amigos deben poner la misma.",
+			"default": "https://TU-SERVIDOR.onrender.com"
+		},
+		"receive-invites": {
+			"type": "bool",
+			"name": "Recibir invitaciones",
+			"description": "Mantiene una conexión con el servidor para que te lleguen invitaciones aunque no estés en el editor.",
+			"default": true
+		}
+	}
+}
