@@ -13,7 +13,7 @@
 			"type": "string",
 			"name": "Dirección del servidor",
 			"description": "La dirección de tu servidor de Render, por ejemplo https://collab-free.onrender.com. Todos tus amigos deben poner la misma.",
-			"default": "https://TU-SERVIDOR.onrender.com"
+			"default": "https://collab-free.onrender.com"
 		},
 		"receive-invites": {
 			"type": "bool",
