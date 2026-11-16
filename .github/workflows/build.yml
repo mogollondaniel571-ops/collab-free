@@ -1,0 +1,28 @@
+name: Compilar mod
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "**"
+
+jobs:
+  build:
+    name: Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compilar el mod
+        id: build
+        uses: geode-sdk/build-geode-mod@main
+        with:
+          path: mod
+          sdk: given
+          target: Win64
+
+      - name: Subir el .geode
+        uses: actions/upload-artifact@v4
+        with:
+          name: collab-free-mod
+          path: ${{ steps.build.outputs.build-output }}
