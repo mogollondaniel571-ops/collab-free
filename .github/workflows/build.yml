@@ -8,8 +8,18 @@ on:
 
 jobs:
   build:
-    name: Windows
+    name: ${{ matrix.mod.name }}
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mod:
+          - name: Collab Free
+            path: mod
+            artifact: collab-free-mod
+          - name: Importador de Mods
+            path: importer
+            artifact: importador-mods
     steps:
       - uses: actions/checkout@v4
 
@@ -17,12 +27,12 @@ jobs:
         id: build
         uses: geode-sdk/build-geode-mod@main
         with:
-          path: mod
+          path: ${{ matrix.mod.path }}
           sdk: given
           target: Win64
 
       - name: Subir el .geode
         uses: actions/upload-artifact@v4
         with:
-          name: collab-free-mod
+          name: ${{ matrix.mod.artifact }}
           path: ${{ steps.build.outputs.build-output }}
