@@ -104,8 +104,8 @@ void Net::hello() {
 
     auto req = web::WebRequest();
     req.bodyJSON(body);
-    // el servidor gratis puede tardar ~1 minuto en "despertar"
-    req.timeout(asp::Duration::fromSecs(90));
+    // el servidor gratis puede tardar 1 o 2 minutos en "despertar"
+    req.timeout(asp::Duration::fromSecs(150));
 
     auto gen = m_generation;
     async::spawn(req.post(url + "/hello"), [this, gen](web::WebResponse res) {
@@ -130,7 +130,7 @@ void Net::hello() {
         bool reconnect = m_wasConnected;
         m_wasConnected = true;
         this->poll();
-        if (reconnect && onReconnected) onReconnected();
+        if (onHello) onHello(data, reconnect);
     });
 }
 
@@ -177,7 +177,7 @@ void Net::poll() {
     });
 }
 
-void Net::call(std::string const& path, matjson::Value body, JsonCallback cb) {
+void Net::call(std::string const& path, matjson::Value body, JsonCallback cb, int timeoutSecs) {
     if (m_state != State::Ready) {
         if (cb) cb(Err(m_lastError.empty() ? std::string("Todavía conectando con el servidor...") : m_lastError));
         return;
@@ -187,7 +187,7 @@ void Net::call(std::string const& path, matjson::Value body, JsonCallback cb) {
 
     auto req = web::WebRequest();
     req.bodyJSON(body);
-    req.timeout(asp::Duration::fromSecs(60));
+    req.timeout(asp::Duration::fromSecs(timeoutSecs));
 
     auto gen = m_generation;
     async::spawn(req.post(this->serverUrl() + path), [this, gen, cb = std::move(cb)](web::WebResponse res) {
