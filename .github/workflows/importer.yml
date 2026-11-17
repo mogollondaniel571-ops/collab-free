@@ -1,0 +1,31 @@
+name: Compilar Importador de Mods
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "**"
+    paths:
+      - "importer/**"
+      - ".github/workflows/importer.yml"
+
+jobs:
+  build:
+    name: Importador de Mods
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compilar el mod
+        id: build
+        uses: geode-sdk/build-geode-mod@main
+        with:
+          path: importer
+          sdk: given
+          target: Win64
+
+      - name: Subir el .geode
+        uses: actions/upload-artifact@v4
+        with:
+          name: importador-mods
+          path: ${{ steps.build.outputs.build-output }}
