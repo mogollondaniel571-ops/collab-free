@@ -21,6 +21,15 @@ const clients = new Map();
 /** roomId -> sala */
 const rooms = new Map();
 
+// registro de lo que pasa (para revisar problemas en /debug)
+const logLines = [];
+function log(msg) {
+    const line = new Date().toISOString().slice(11, 19) + " " + msg;
+    console.log(line);
+    logLines.push(line);
+    if (logLines.length > 200) logLines.shift();
+}
+
 function newId(bytes = 6) {
     return crypto.randomBytes(bytes).toString("hex");
 }
@@ -122,6 +131,7 @@ function leaveRoom(client) {
     const room = rooms.get(client.roomId);
     client.roomId = null;
     if (!room) return;
+    log(`${client.username} salió de la sala ${room.id}`);
     room.members.delete(client.id);
     room.cursors.delete(client.id);
     if (room.owner === client.id) {
@@ -163,6 +173,7 @@ const routes = {
             if (c.accountID === accountID) removeClient(c);
         }
         const client = makeClient(accountID, username);
+        log(`hola: ${username} (${accountID})`);
         return [200, { client: client.id, token: client.token }];
     },
 
@@ -194,6 +205,7 @@ const routes = {
         }
         rooms.set(room.id, room);
         client.roomId = room.id;
+        log(`sala ${room.id} creada por ${client.username} (${room.objects.size} objetos)`);
         return [200, { roomId: room.id }];
     },
 
@@ -207,11 +219,15 @@ const routes = {
             if (targetAccount && c.accountID === targetAccount) target = c;
             else if (!targetAccount && targetName && c.username.toLowerCase() === targetName) target = c;
         }
-        if (!target) return [404, { error: "Ese jugador no tiene el mod abierto ahora." }];
+        if (!target) {
+            log(`invitación fallida de ${client.username}: ${targetAccount || targetName} no conectado`);
+            return [404, { error: "Ese jugador no tiene el mod abierto ahora." }];
+        }
         if (target.id === client.id) return [400, { error: "No te puedes invitar a ti mismo." }];
         if (room.members.has(target.id)) return [400, { error: "Ya está en la sala." }];
         if (room.members.size >= MAX_MEMBERS) return [400, { error: "La sala está llena (máximo 6)." }];
         room.allowed.add(target.accountID);
+        log(`${client.username} invitó a ${target.username} a la sala ${room.id}`);
         pushEvent(target, {
             type: "invite",
             roomId: room.id,
@@ -236,6 +252,7 @@ const routes = {
         if (!room.owner) room.owner = client.id;
         client.roomId = room.id;
         broadcast(room, { type: "join", member: publicMember(client) }, client.id);
+        log(`${client.username} entró a la sala ${room.id} (${room.members.size}/6)`);
         // se envían también los cursores actuales
         const snap = roomSnapshot(room);
         snap.cursors = [...room.cursors.entries()].map(([id, p]) => ({ from: id, x: p.x, y: p.y }));
@@ -261,6 +278,10 @@ const routes = {
             } else if (op.t === "d") {
                 room.objects.delete(id);
                 ops.push({ t: "d", id });
+            } else if (op.t === "h") {
+                // ajustes del nivel (colores, canción...)
+                room.header = String(op.s || "");
+                ops.push({ t: "h", id, s: room.header });
             }
         }
         if (ops.length) {
@@ -320,6 +341,18 @@ function readBody(req) {
 
 const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, "http://localhost");
+
+    if (req.method === "GET" && url.pathname === "/debug") {
+        const online = [...clients.values()].map((c) => `${c.username} ${c.roomId ? "(sala " + c.roomId + ")" : ""}`);
+        const roomList = [...rooms.values()].map((r) => ({
+            id: r.id,
+            nivel: r.levelName,
+            miembros: roomMembers(r).map((c) => c.username),
+            objetos: r.objects.size,
+        }));
+        sendJson(res, 200, { conectados: online, salas: roomList, registro: logLines.slice(-80) });
+        return;
+    }
 
     if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
         sendJson(res, 200, {
