@@ -6,6 +6,7 @@
 #include <Geode/modify/EditorUI.hpp>
 #include <Geode/modify/EditLevelLayer.hpp>
 #include <Geode/modify/EditorPauseLayer.hpp>
+#include <Geode/modify/ProfilePage.hpp>
 #include <Geode/binding/ButtonSprite.hpp>
 #include <Geode/binding/CCMenuItemSpriteExtra.hpp>
 #include <Geode/binding/GJAccountManager.hpp>
@@ -13,6 +14,7 @@
 #include "Net.hpp"
 #include "Session.hpp"
 #include "InvitePopup.hpp"
+#include "Invites.hpp"
 
 using namespace geode::prelude;
 using namespace collab;
@@ -120,14 +122,58 @@ class $modify(CollabLevelEditorLayer, LevelEditorLayer) {
 
 // ------------------------------------------------------------------ salir del editor
 
+// Salir del editor NO te saca de la sala: solo se envía lo último que cambiaste.
+// Para salir de la sala está el botón "Salir de la sala" en la ventana Collab.
 class $modify(CollabEditorPauseLayer, EditorPauseLayer) {
     void onSaveAndExit(CCObject* sender) {
-        Session::get().leave(true, "guardar y salir");
+        Session::get().beforeEditorExit(m_editorLayer);
         EditorPauseLayer::onSaveAndExit(sender);
     }
     void onSaveAndPlay(CCObject* sender) {
-        Session::get().leave(true, "guardar y jugar");
+        Session::get().beforeEditorExit(m_editorLayer);
         EditorPauseLayer::onSaveAndPlay(sender);
+    }
+    void onExitEditor(CCObject* sender) {
+        Session::get().beforeEditorExit(m_editorLayer);
+        EditorPauseLayer::onExitEditor(sender);
+    }
+    void onExitNoSave(CCObject* sender) {
+        Session::get().beforeEditorExit(m_editorLayer);
+        EditorPauseLayer::onExitNoSave(sender);
+    }
+};
+
+// ------------------------------------------------------------------ bandeja en tu perfil
+
+class $modify(CollabProfilePage, ProfilePage) {
+    struct Fields {
+        CCMenuItemSpriteExtra* inbox = nullptr;
+    };
+
+    bool init(int accountID, bool ownProfile) {
+        if (!ProfilePage::init(accountID, ownProfile)) return false;
+        if (!ownProfile) return true;
+
+        auto winSize = CCDirector::get()->getWinSize();
+        auto menu = CCMenu::create();
+        menu->setID("collab-inbox-menu"_spr);
+        menu->setPosition({0, 0});
+        menu->setContentSize(winSize);
+        auto btn = createInboxButton(this, menu_selector(CollabProfilePage::onCollabInbox));
+        btn->setPosition({winSize.width / 2 - 168.f, winSize.height / 2 + 112.f});
+        menu->addChild(btn);
+        m_mainLayer->addChild(menu, 20);
+        m_fields->inbox = btn;
+        this->schedule(schedule_selector(CollabProfilePage::updateCollabInbox), 0.5f);
+        return true;
+    }
+
+    void updateCollabInbox(float) {
+        updateInboxButton(m_fields->inbox);
+    }
+
+    void onCollabInbox(CCObject*) {
+        if (auto popup = InboxPopup::create()) popup->show();
     }
 };
 
@@ -143,10 +189,12 @@ class $modify(CollabEditLevelLayer, EditLevelLayer) {
         menu->setPosition({0, 0});
         menu->setContentSize(winSize);
 
-        auto spr = ButtonSprite::create("Collab", "goldFont.fnt", "GJ_button_01.png", 0.7f);
+        bool inRoom = Session::get().isRoomLevel(level);
+        auto spr = ButtonSprite::create(inRoom ? "Volver a la sala" : "Collab", "goldFont.fnt",
+            inRoom ? "GJ_button_02.png" : "GJ_button_01.png", inRoom ? 0.55f : 0.7f);
         auto btn = CCMenuItemSpriteExtra::create(spr, this, menu_selector(CollabEditLevelLayer::onCollab));
         btn->setID("collab-button"_spr);
-        btn->setPosition({winSize.width - 50.f, winSize.height - 25.f});
+        btn->setPosition({winSize.width - (inRoom ? 75.f : 50.f), winSize.height - 25.f});
         menu->addChild(btn);
         this->addChild(menu, 10);
         return true;
@@ -159,7 +207,17 @@ class $modify(CollabEditLevelLayer, EditLevelLayer) {
             return;
         }
         Net::get().start();
-        Session::get().setHostOnNextEditor(m_level);
+        auto& s = Session::get();
+        if (s.isActive() && !s.isRoomLevel(m_level)) {
+            FLAlertLayer::create("Collab",
+                fmt::format("Ya estás en la sala de <cg>{}</c>. Solo puedes estar en una sala.\n"
+                    "Para crear otra, entra a ese nivel y toca <cy>Collab</c> > <cr>Salir de la sala</c>.",
+                    s.roomLevelName()),
+                "OK")->show();
+            return;
+        }
+        // si es el nivel de tu sala, solo se abre el editor y se sincroniza solo
+        if (!s.isRoomLevel(m_level)) s.setHostOnNextEditor(m_level);
         // abre el editor como el botón normal de editar
         this->onEdit(sender);
     }
