@@ -653,8 +653,9 @@ void Session::onEvent(matjson::Value const& ev) {
             if (id != Net::get().clientId()) {
                 this->removeMember(id);
                 bool dropped = ev.contains("disconnected") && ev["disconnected"].asBool().unwrapOr(false);
-                notify(fmt::format(dropped ? "{} se desconectó (volverá a la sala al abrir el juego)"
-                                           : "{} salió de la sala", jstr(m, "username")));
+                auto name = jstr(m, "username");
+                notify(dropped ? fmt::format("{} se desconectó (volverá a la sala al abrir el juego)", name)
+                               : fmt::format("{} salió de la sala", name));
             }
         }
         auto owner = jstr(ev, "owner");
