@@ -5,7 +5,7 @@
 	},
 	"id": "daniel.collab-free",
 	"name": "Collab Free",
-	"version": "v1.0.0",
+	"version": "v1.1.0",
 	"developer": "Daniel",
 	"description": "Edita un nivel con hasta 5 amigos en tiempo real, gratis.",
 	"settings": {
@@ -19,6 +19,12 @@
 			"type": "bool",
 			"name": "Recibir invitaciones",
 			"description": "Mantiene una conexión con el servidor para que te lleguen invitaciones aunque no estés en el editor.",
+			"default": true
+		},
+		"sync-settings": {
+			"type": "bool",
+			"name": "Sincronizar ajustes del nivel",
+			"description": "Colores, canción y demás ajustes del nivel se pasan en tiempo real. Es experimental: si el juego se cierra al cambiar ajustes, desactívalo.",
 			"default": true
 		}
 	}
