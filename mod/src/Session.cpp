@@ -797,7 +797,13 @@ void Session::sendCursor() {
     auto ed = this->editor();
     if (!ed || !ed->m_objectLayer || m_cursorInFlight || !Net::get().isReady()) return;
     if (m_members.size() <= 1) return; // nadie más lo va a ver
-    auto pos = ed->m_objectLayer->convertToNodeSpace(geode::cocos::getMousePos());
+#ifdef GEODE_IS_ANDROID
+    // en el celular no hay mouse: se usa el centro de la pantalla
+    auto screen = CCDirector::get()->getWinSize() / 2.f;
+#else
+    auto screen = geode::cocos::getMousePos();
+#endif
+    auto pos = ed->m_objectLayer->convertToNodeSpace(screen);
     if (ccpDistance(pos, m_lastCursorSent) < 2.f) return;
     m_lastCursorSent = pos;
     m_cursorInFlight = true;
