@@ -7,16 +7,22 @@
 #include <Geode/binding/GameLevelManager.hpp>
 #include <Geode/binding/GJUserScore.hpp>
 #include <Geode/binding/GJAccountManager.hpp>
+#include <Geode/ui/Notification.hpp>
 
 using namespace geode::prelude;
 
 namespace collab {
 
-static constexpr float W = 380.f;
-static constexpr float H = 270.f;
-static constexpr float LIST_W = 300.f;
-static constexpr float LIST_H = 110.f;
+static constexpr float W = 440.f;
+static constexpr float H = 290.f;
+static constexpr float LIST_W = 265.f;
+static constexpr float LIST_H = 150.f;
+static constexpr float LIST_X = 72.f;
+static constexpr float MEM_W = 130.f;
+static constexpr float MEM_X = -140.f;
+static constexpr float PANEL_Y = 10.f;
 static constexpr float ROW_H = 26.f;
+static constexpr float MEM_ROW = 24.f;
 
 InvitePopup* InvitePopup::create(LevelEditorLayer* editor, bool autoStart) {
     auto ret = new InvitePopup();
@@ -40,29 +46,33 @@ bool InvitePopup::init(LevelEditorLayer* editor, bool autoStart) {
 
     m_status = CCLabelBMFont::create("", "chatFont.fnt");
     m_status->setScale(0.7f);
-    m_mainLayer->addChildAtPosition(m_status, Anchor::Bottom, ccp(0, 14));
+    m_mainLayer->addChildAtPosition(m_status, Anchor::Bottom, ccp(0, 13));
 
-    // ---------------- antes de crear la sala
+    // ---------------- antes de crear la sala (o si estás en la sala de otro nivel)
     m_startNode = CCNode::create();
     m_startNode->setContentSize({W, H});
     m_startNode->setAnchorPoint({0.5f, 0.5f});
     m_mainLayer->addChildAtPosition(m_startNode, Anchor::Center);
 
-    auto info = CCLabelBMFont::create(
-        "Crea una sala para editar este nivel\ncon hasta 5 amigos en tiempo real.",
-        "chatFont.fnt");
-    info->setAlignment(kCCTextAlignmentCenter);
-    info->setScale(0.85f);
-    m_startNode->addChildAtPosition(info, Anchor::Center, ccp(0, 40));
+    m_startInfo = CCLabelBMFont::create("", "chatFont.fnt");
+    m_startInfo->setAlignment(kCCTextAlignmentCenter);
+    m_startNode->addChildAtPosition(m_startInfo, Anchor::Center, ccp(0, 40));
 
     auto startMenu = CCMenu::create();
     startMenu->setContentSize({W, 60});
-    m_startNode->addChildAtPosition(startMenu, Anchor::Center, ccp(-W / 2, -40));
+    startMenu->ignoreAnchorPointForPosition(false);
+    startMenu->setAnchorPoint({0.5f, 0.5f});
+    m_startNode->addChildAtPosition(startMenu, Anchor::Center, ccp(0, -40));
     m_startBtn = CCMenuItemSpriteExtra::create(
         ButtonSprite::create("Crear sala", "goldFont.fnt", "GJ_button_01.png", 0.9f),
         this, menu_selector(InvitePopup::onStart));
     m_startBtn->setPosition({W / 2, 30});
     startMenu->addChild(m_startBtn);
+    m_leaveOtherBtn = CCMenuItemSpriteExtra::create(
+        ButtonSprite::create("Salir de esa sala", "goldFont.fnt", "GJ_button_06.png", 0.7f),
+        this, menu_selector(InvitePopup::onLeave));
+    m_leaveOtherBtn->setPosition({W / 2, 30});
+    startMenu->addChild(m_leaveOtherBtn);
 
     // ---------------- dentro de la sala
     m_roomNode = CCNode::create();
@@ -70,23 +80,37 @@ bool InvitePopup::init(LevelEditorLayer* editor, bool autoStart) {
     m_roomNode->setAnchorPoint({0.5f, 0.5f});
     m_mainLayer->addChildAtPosition(m_roomNode, Anchor::Center);
 
-    m_membersLabel = CCLabelBMFont::create("", "chatFont.fnt");
-    m_membersLabel->setScale(0.7f);
-    m_roomNode->addChildAtPosition(m_membersLabel, Anchor::Top, ccp(0, -45));
+    // quién está en la sala
+    m_membersTitle = CCLabelBMFont::create("En la sala", "goldFont.fnt");
+    m_membersTitle->setScale(0.5f);
+    m_roomNode->addChildAtPosition(m_membersTitle, Anchor::Center, ccp(MEM_X, PANEL_Y + LIST_H / 2 + 12));
 
+    auto memBg = CCLayerColor::create({0, 0, 0, 80}, MEM_W, LIST_H);
+    memBg->ignoreAnchorPointForPosition(false);
+    memBg->setAnchorPoint({0.5f, 0.5f});
+    m_roomNode->addChildAtPosition(memBg, Anchor::Center, ccp(MEM_X, PANEL_Y));
+
+    m_membersList = CCNode::create();
+    m_membersList->setContentSize({MEM_W, LIST_H});
+    m_membersList->ignoreAnchorPointForPosition(false);
+    m_membersList->setAnchorPoint({0.5f, 0.5f});
+    m_roomNode->addChildAtPosition(m_membersList, Anchor::Center, ccp(MEM_X, PANEL_Y));
+
+    // tus amigos
     auto listTitle = CCLabelBMFont::create("Tus amigos", "goldFont.fnt");
     listTitle->setScale(0.5f);
-    m_roomNode->addChildAtPosition(listTitle, Anchor::Top, ccp(-LIST_W / 2 + 40, -64));
+    listTitle->setAnchorPoint({0, 0.5f});
+    m_roomNode->addChildAtPosition(listTitle, Anchor::Center, ccp(LIST_X - LIST_W / 2, PANEL_Y + LIST_H / 2 + 12));
 
     auto listBg = CCLayerColor::create({0, 0, 0, 80}, LIST_W, LIST_H);
     listBg->ignoreAnchorPointForPosition(false);
     listBg->setAnchorPoint({0.5f, 0.5f});
-    m_roomNode->addChildAtPosition(listBg, Anchor::Center, ccp(0, 8));
+    m_roomNode->addChildAtPosition(listBg, Anchor::Center, ccp(LIST_X, PANEL_Y));
 
     m_list = ScrollLayer::create({LIST_W, LIST_H});
     m_list->ignoreAnchorPointForPosition(false);
     m_list->setAnchorPoint({0.5f, 0.5f});
-    m_roomNode->addChildAtPosition(m_list, Anchor::Center, ccp(0, 8));
+    m_roomNode->addChildAtPosition(m_list, Anchor::Center, ccp(LIST_X, PANEL_Y));
 
     auto roomMenu = CCMenu::create();
     roomMenu->setContentSize({W, H});
@@ -95,29 +119,29 @@ bool InvitePopup::init(LevelEditorLayer* editor, bool autoStart) {
     m_roomNode->addChildAtPosition(roomMenu, Anchor::Center);
 
     auto refreshSpr = CCSprite::createWithSpriteFrameName("GJ_updateBtn_001.png");
-    refreshSpr->setScale(0.5f);
+    refreshSpr->setScale(0.45f);
     auto refreshBtn = CCMenuItemSpriteExtra::create(refreshSpr, this, menu_selector(InvitePopup::onRefresh));
-    refreshBtn->setPosition({W / 2 + LIST_W / 2 - 10, H / 2 + LIST_H / 2 + 20});
+    refreshBtn->setPosition({W / 2 + LIST_X + LIST_W / 2 - 10, H / 2 + PANEL_Y + LIST_H / 2 + 12});
     roomMenu->addChild(refreshBtn);
 
     m_nameInput = TextInput::create(170.f, "Nombre de usuario");
     m_nameInput->setCommonFilter(CommonFilter::Any);
-    m_nameInput->setScale(0.8f);
-    m_roomNode->addChildAtPosition(m_nameInput, Anchor::Center, ccp(-50, -70));
+    m_nameInput->setScale(0.75f);
+    m_roomNode->addChildAtPosition(m_nameInput, Anchor::Center, ccp(-25, -86));
 
     auto inviteNameBtn = CCMenuItemSpriteExtra::create(
         ButtonSprite::create("Invitar", "goldFont.fnt", "GJ_button_01.png", 0.6f),
         this, menu_selector(InvitePopup::onInviteName));
-    inviteNameBtn->setPosition({W / 2 + 75, H / 2 - 70});
+    inviteNameBtn->setPosition({W / 2 + 100, H / 2 - 86});
     roomMenu->addChild(inviteNameBtn);
 
     auto leaveBtn = CCMenuItemSpriteExtra::create(
-        ButtonSprite::create("Salir de la sala", "goldFont.fnt", "GJ_button_06.png", 0.55f),
+        ButtonSprite::create("Salir de la sala", "goldFont.fnt", "GJ_button_06.png", 0.5f),
         this, menu_selector(InvitePopup::onLeave));
-    leaveBtn->setPosition({W / 2, 42});
+    leaveBtn->setPosition({W / 2, H / 2 - 114});
     roomMenu->addChild(leaveBtn);
 
-    m_wasActive = Session::get().isActive();
+    m_wasActive = Session::get().isInEditor(m_editor);
     this->refreshState();
     this->scheduleUpdate();
 
@@ -134,45 +158,100 @@ void InvitePopup::setStatus(std::string const& text, ccColor3B color) {
     m_status->limitLabelWidth(W - 30.f, 0.7f, 0.3f);
 }
 
-void InvitePopup::refreshState() {
-    auto& s = Session::get();
-    bool active = s.isActive();
-    m_startNode->setVisible(!active);
-    m_roomNode->setVisible(active);
+static char const* stateText(std::string const& state) {
+    if (state == "test") return "probando el nivel";
+    if (state == "away") return "fuera del editor";
+    return "editando";
+}
 
-    if (active) {
-        auto list = s.members();
-        std::string names;
-        for (auto m : list) {
-            if (!names.empty()) names += ", ";
-            names += m->username;
+void InvitePopup::buildMembers() {
+    auto& s = Session::get();
+    auto list = s.members();
+
+    std::string sig = s.ownerId();
+    for (auto m : list) sig += "|" + m->clientId + m->state;
+    if (sig == m_membersSig) return;
+    m_membersSig = sig;
+
+    m_membersTitle->setString(fmt::format("En la sala ({}/6)", list.size()).c_str());
+    m_membersList->removeAllChildren();
+    for (size_t i = 0; i < list.size(); i++) {
+        auto m = list[i];
+        float y = LIST_H - MEM_ROW * (i + 0.5f) - 2.f;
+
+        if (auto dot = CCSprite::createWithSpriteFrameName("whiteCircle_001.png")) {
+            dot->setScale(0.22f);
+            dot->setColor(m->color);
+            dot->setPosition({10, y});
+            m_membersList->addChild(dot);
         }
-        m_membersLabel->setString(fmt::format("En la sala ({}/6): {}", list.size(), names).c_str());
-        m_membersLabel->limitLabelWidth(W - 40.f, 0.7f, 0.3f);
-        if (!m_friendsLoaded) this->loadFriends();
+
+        bool owner = m->clientId == s.ownerId();
+        bool me = m->clientId == Net::get().clientId();
+        auto nameText = m->username + (me ? " (tú)" : "");
+        auto name = CCLabelBMFont::create(nameText.c_str(), "goldFont.fnt");
+        name->setAnchorPoint({0, 0.5f});
+        name->limitLabelWidth(MEM_W - 26.f, 0.42f, 0.2f);
+        name->setPosition({20, y + 5});
+        m_membersList->addChild(name);
+
+        auto stateStr = std::string(stateText(m->state)) + (owner ? " · anfitrión" : "");
+        auto state = CCLabelBMFont::create(stateStr.c_str(), "chatFont.fnt");
+        state->setAnchorPoint({0, 0.5f});
+        state->limitLabelWidth(MEM_W - 26.f, 0.42f, 0.2f);
+        state->setColor(m->state == "away" ? ccColor3B{170, 170, 170}
+            : m->state == "test" ? ccColor3B{120, 200, 255} : ccColor3B{120, 255, 120});
+        state->setPosition({20, y - 6});
+        m_membersList->addChild(state);
     }
 }
 
+void InvitePopup::refreshState() {
+    auto& s = Session::get();
+    bool here = s.isInEditor(m_editor);
+    bool other = s.isActive() && !here;
+    m_startNode->setVisible(!here);
+    m_roomNode->setVisible(here);
+
+    if (!here) {
+        if (other) {
+            m_startInfo->setString(fmt::format(
+                "Ya estás en la sala de \"{}\".\nSolo puedes estar en una sala a la vez:\n"
+                "sal de esa para crear una aquí.", s.roomLevelName()).c_str());
+        } else {
+            m_startInfo->setString(
+                "Crea una sala para editar este nivel\ncon hasta 5 amigos en tiempo real.\n"
+                "Sirve también con niveles ya avanzados.");
+        }
+        m_startInfo->limitLabelWidth(W - 40.f, 0.8f, 0.3f);
+        m_startBtn->setVisible(!other);
+        m_leaveOtherBtn->setVisible(other);
+        return;
+    }
+    this->buildMembers();
+    if (!m_friendsLoaded) this->loadFriends();
+}
+
 void InvitePopup::update(float dt) {
-    bool active = Session::get().isActive();
-    if (active != m_wasActive) {
-        m_wasActive = active;
-        if (active) this->setStatus("Sala creada. ¡Invita a tus amigos!", {120, 255, 120});
+    bool here = Session::get().isInEditor(m_editor);
+    if (here != m_wasActive) {
+        m_wasActive = here;
+        if (here) this->setStatus("Sala creada. ¡Invita a tus amigos!", {120, 255, 120});
     }
     this->refreshState();
 
-    if (!active && !Session::get().isBusy()) {
+    if (!Session::get().isActive() && !Session::get().isBusy()) {
         auto& net = Net::get();
         if (m_wantStart && net.isReady()) {
             this->onStart(nullptr);
         } else if (m_wantStart && net.state() == Net::State::Connecting) {
-            this->setStatus("Conectando con el servidor... (si estaba dormido tarda ~1 minuto)", {255, 220, 120});
+            this->setStatus("Despertando el servidor... (puede tardar 1 o 2 minutos)", {255, 220, 120});
         } else if (m_wantStart && net.state() == Net::State::Off && !net.lastError().empty()) {
-            this->setStatus(net.lastError(), {255, 120, 120});
+            this->setStatus(net.lastError() + " Reintentando...", {255, 120, 120});
         }
     }
 
-    if (active && m_friendsLoaded) {
+    if (here && m_friendsLoaded) {
         m_onlineTimer += dt;
         if (m_onlineTimer > 8.f) {
             m_onlineTimer = 0.f;
@@ -198,7 +277,7 @@ void InvitePopup::onStart(CCObject*) {
         return;
     }
     m_wantStart = false;
-    this->setStatus("Creando sala...", {255, 220, 120});
+    this->setStatus("Creando sala (si el nivel es grande tarda un poco)...", {255, 220, 120});
     Ref<InvitePopup> self = this;
     Session::get().host(m_editor, [self](bool ok, std::string err) {
         if (!self->getParent()) return;
@@ -214,11 +293,13 @@ void InvitePopup::onStart(CCObject*) {
 void InvitePopup::onLeave(CCObject*) {
     Ref<InvitePopup> self = this;
     createQuickPopup("Salir de la sala",
-        "¿Seguro que quieres salir? Tus amigos podrán seguir editando y tú conservas tu copia del nivel.",
+        "¿Seguro que quieres salir de la sala?\nTus amigos podrán seguir editando y tú conservas tu copia del nivel.\n"
+        "Para volver te tendrán que invitar otra vez.",
         "Cancelar", "Salir",
         [self](FLAlertLayer*, bool yes) {
             if (!yes) return;
             Session::get().leave(true, "botón salir de la sala");
+            Notification::create("Saliste de la sala", NotificationIcon::Info, 2.f)->show();
             self->onClose(nullptr);
         });
 }
