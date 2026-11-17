@@ -37,12 +37,12 @@ public:
     std::string serverUrl() const;
 
     /// Llama a una ruta del servidor. El callback corre en el hilo principal.
-    void call(std::string const& path, matjson::Value body, JsonCallback cb);
+    void call(std::string const& path, matjson::Value body, JsonCallback cb, int timeoutSecs = 60);
 
     /// Lo que hay que hacer con cada evento que llega (lo pone Session).
     std::function<void(matjson::Value const&)> onEvent;
-    /// Se llama cuando nos volvemos a conectar después de perder la sesión.
-    std::function<void()> onReconnected;
+    /// Se llama cada vez que se conecta (reconnect = ya estaba conectado antes).
+    std::function<void(matjson::Value const&, bool)> onHello;
 
 private:
     void hello();
