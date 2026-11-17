@@ -1,11 +1,12 @@
 {
 	"geode": "6.0.0-alpha.2",
 	"gd": {
-		"win": "2.2091"
+		"win": "2.2091",
+		"android": "2.2091"
 	},
 	"id": "daniel.collab-free",
 	"name": "Collab Free",
-	"version": "v1.1.0",
+	"version": "v1.2.0",
 	"developer": "Daniel",
 	"description": "Edita un nivel con hasta 5 amigos en tiempo real, gratis.",
 	"settings": {
