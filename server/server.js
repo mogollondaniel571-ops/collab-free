@@ -10,7 +10,8 @@ const PORT = process.env.PORT || 3000;
 const MAX_MEMBERS = 6;
 const POLL_TIMEOUT_MS = 25000;      // cuánto espera una petición de /poll
 const CLIENT_TIMEOUT_MS = 90000;    // si un jugador no pregunta en 90 s, se le saca
-const ROOM_EMPTY_TTL_MS = 5 * 60000; // una sala vacía se borra a los 5 min
+const ROOM_EMPTY_TTL_MS = 10 * 60000;      // sala vacía y sin nadie por volver: 10 min
+const ROOM_RETURN_TTL_MS = 24 * 3600000;   // sala con gente "por volver": hasta 24 h (mientras el servidor esté prendido)
 const MAX_BODY = 60 * 1024 * 1024;  // 60 MB (niveles grandes)
 const MAX_QUEUE = 20000;            // eventos pendientes por jugador
 
@@ -51,6 +52,7 @@ function makeClient(accountID, username) {
         seq: 0,         // número del último evento creado
         waiter: null,   // petición /poll esperando
         roomId: null,
+        state: "edit",  // edit = editando, test = probando, away = fuera del editor
     };
     clients.set(client.id, client);
     return client;
@@ -64,13 +66,14 @@ function auth(body) {
 }
 
 function pushEvent(client, event) {
-    // los cursores se fusionan: solo importa la última posición
-    if (event.type === "cursor") {
+    // cursores y cubos se fusionan: solo importa la última posición
+    if (event.type === "cursor" || event.type === "player") {
         for (let i = client.queue.length - 1; i >= 0; i--) {
             const e = client.queue[i];
-            if (e.type === "cursor" && e.from === event.from) {
-                e.x = event.x;
-                e.y = event.y;
+            if (e.type === event.type && e.from === event.from) {
+                const seq = e.seq;
+                Object.assign(e, event);
+                e.seq = seq;
                 flush(client);
                 return;
             }
@@ -101,8 +104,11 @@ function dropAcked(client, since) {
     client.queue = client.queue.filter((e) => e.seq > since);
 }
 
-function removeClient(client) {
-    leaveRoom(client);
+// explicit = salió con el botón; si no, se desconectó y vuelve al abrir el juego
+function removeClient(client, explicit = false) {
+    const room = rooms.get(client.roomId);
+    if (room && !explicit) room.returning.add(client.accountID);
+    leaveRoom(client, !explicit);
     if (client.waiter) {
         clearTimeout(client.waiter.timer);
         sendJson(client.waiter.res, 200, { events: [] });
@@ -114,7 +120,7 @@ function removeClient(client) {
 // ---------------------------------------------------------------- salas
 
 function publicMember(c) {
-    return { client: c.id, accountID: c.accountID, username: c.username };
+    return { client: c.id, accountID: c.accountID, username: c.username, state: c.state || "edit" };
 }
 
 function roomMembers(room) {
@@ -127,13 +133,14 @@ function broadcast(room, event, exceptId = null) {
     }
 }
 
-function leaveRoom(client) {
+function leaveRoom(client, disconnected = false) {
     const room = rooms.get(client.roomId);
     client.roomId = null;
     if (!room) return;
     log(`${client.username} salió de la sala ${room.id}`);
     room.members.delete(client.id);
     room.cursors.delete(client.id);
+    room.players.delete(client.id);
     if (room.owner === client.id) {
         // el anfitrión se fue: el siguiente pasa a ser anfitrión
         const next = [...room.members][0];
@@ -143,6 +150,7 @@ function leaveRoom(client) {
         type: "leave",
         member: publicMember(client),
         owner: room.owner,
+        disconnected,
     });
     if (room.members.size === 0) room.emptySince = now();
 }
@@ -152,6 +160,7 @@ function roomSnapshot(room) {
         roomId: room.id,
         levelName: room.levelName,
         header: room.header,
+        meta: room.meta,
         objects: [...room.objects.entries()],
         owner: room.owner,
         members: roomMembers(room).map(publicMember),
@@ -169,12 +178,33 @@ const routes = {
             return [400, { error: "Necesitas iniciar sesión en tu cuenta de Geometry Dash." }];
         }
         // si ya había una conexión vieja de esta cuenta, se reemplaza
-        for (const c of clients.values()) {
+        for (const c of [...clients.values()]) {
             if (c.accountID === accountID) removeClient(c);
         }
         const client = makeClient(accountID, username);
         log(`hola: ${username} (${accountID})`);
-        return [200, { client: client.id, token: client.token }];
+        // ¿seguía en una sala? vuelve a entrar ("fuera del editor")
+        let roomInfo = null;
+        for (const room of rooms.values()) {
+            if (!room.returning.has(accountID)) continue;
+            room.returning.delete(accountID);
+            if (room.members.size >= MAX_MEMBERS) continue;
+            client.state = "away";
+            room.members.add(client.id);
+            room.emptySince = null;
+            if (!room.owner) room.owner = client.id;
+            client.roomId = room.id;
+            broadcast(room, { type: "join", member: publicMember(client) }, client.id);
+            log(`${username} volvió a la sala ${room.id}`);
+            roomInfo = {
+                roomId: room.id,
+                levelName: room.levelName,
+                owner: room.owner,
+                members: roomMembers(room).map(publicMember),
+            };
+            break;
+        }
+        return [200, { client: client.id, token: client.token, room: roomInfo }];
     },
 
     // ¿cuáles de estas cuentas tienen el mod abierto ahora?
@@ -188,7 +218,9 @@ const routes = {
     },
 
     "/room/create": (body, client) => {
-        leaveRoom(client);
+        if (client.roomId && rooms.has(client.roomId)) {
+            return [400, { error: "Ya estás en una sala. Sal de ella primero." }];
+        }
         const room = {
             id: newId(4),
             levelName: String(body.levelName || "Nivel").slice(0, 40),
@@ -197,7 +229,10 @@ const routes = {
             owner: client.id,
             members: new Set([client.id]),
             cursors: new Map(),
+            players: new Map(),
+            meta: String(body.meta || ""),
             allowed: new Set([client.accountID]), // cuentas que pueden entrar
+            returning: new Set(), // cuentas que se desconectaron sin salir
             emptySince: null,
         };
         for (const [id, str] of body.objects || []) {
@@ -227,14 +262,15 @@ const routes = {
         if (room.members.has(target.id)) return [400, { error: "Ya está en la sala." }];
         if (room.members.size >= MAX_MEMBERS) return [400, { error: "La sala está llena (máximo 6)." }];
         room.allowed.add(target.accountID);
-        log(`${client.username} invitó a ${target.username} a la sala ${room.id}`);
+        const busy = !!(target.roomId && target.roomId !== room.id && rooms.has(target.roomId));
+        log(`${client.username} invitó a ${target.username} a la sala ${room.id}${busy ? " (está en otra sala)" : ""}`);
         pushEvent(target, {
             type: "invite",
             roomId: room.id,
             levelName: room.levelName,
             from: publicMember(client),
         });
-        return [200, { ok: true, username: target.username }];
+        return [200, { ok: true, username: target.username, busy }];
     },
 
     "/room/join": (body, client) => {
@@ -246,9 +282,13 @@ const routes = {
         if (!room.members.has(client.id) && room.members.size >= MAX_MEMBERS) {
             return [400, { error: "La sala está llena (máximo 6)." }];
         }
-        if (client.roomId !== room.id) leaveRoom(client);
+        if (client.roomId && client.roomId !== room.id && rooms.has(client.roomId)) {
+            return [400, { error: "Ya estás en otra sala. Sal de ella primero." }];
+        }
+        room.returning.delete(client.accountID);
         room.members.add(client.id);
         room.emptySince = null;
+        if (body.state) client.state = String(body.state);
         if (!room.owner) room.owner = client.id;
         client.roomId = room.id;
         broadcast(room, { type: "join", member: publicMember(client) }, client.id);
@@ -256,10 +296,13 @@ const routes = {
         // se envían también los cursores actuales
         const snap = roomSnapshot(room);
         snap.cursors = [...room.cursors.entries()].map(([id, p]) => ({ from: id, x: p.x, y: p.y }));
+        snap.players = [...room.players.values()];
         return [200, snap];
     },
 
     "/room/leave": (body, client) => {
+        const room = rooms.get(client.roomId);
+        if (room) room.returning.delete(client.accountID);
         leaveRoom(client);
         return [200, { ok: true }];
     },
@@ -282,6 +325,10 @@ const routes = {
                 // ajustes del nivel (colores, canción...)
                 room.header = String(op.s || "");
                 ops.push({ t: "h", id, s: room.header });
+            } else if (op.t === "g") {
+                // canción, efectos de sonido y pista del nivel
+                room.meta = String(op.s || "");
+                ops.push({ t: "g", id, s: room.meta });
             }
         }
         if (ops.length) {
@@ -298,6 +345,40 @@ const routes = {
         const y = Number(body.y) || 0;
         room.cursors.set(client.id, { x, y });
         broadcast(room, { type: "cursor", from: client.id, x, y }, client.id);
+        return [200, { ok: true }];
+    },
+
+    // dónde está cada uno: editando, probando el nivel o fuera del editor
+    "/room/status": (body, client) => {
+        const state = ["edit", "test", "away"].includes(body.state) ? body.state : "edit";
+        client.state = state;
+        const room = rooms.get(client.roomId);
+        if (!room) return [400, { error: "No estás en una sala." }];
+        broadcast(room, { type: "status", from: client.id, state }, client.id);
+        return [200, { ok: true }];
+    },
+
+    // el cubo de quien está probando el nivel
+    "/room/player": (body, client) => {
+        const room = rooms.get(client.roomId);
+        if (!room) return [400, { error: "No estás en una sala." }];
+        const ev = {
+            type: "player",
+            from: client.id,
+            on: !!body.on,
+            x: Number(body.x) || 0,
+            y: Number(body.y) || 0,
+            r: Number(body.r) || 0,
+            m: Number(body.m) || 0,
+            i: Number(body.i) || 1,
+            s: Number(body.s) || 1,
+            f: !!body.f,
+            c1: Number(body.c1) || 0,
+            c2: Number(body.c2) || 0,
+        };
+        if (ev.on) room.players.set(client.id, ev);
+        else room.players.delete(client.id);
+        broadcast(room, ev, client.id);
         return [200, { ok: true }];
     },
 
@@ -347,7 +428,8 @@ const server = http.createServer(async (req, res) => {
         const roomList = [...rooms.values()].map((r) => ({
             id: r.id,
             nivel: r.levelName,
-            miembros: roomMembers(r).map((c) => c.username),
+            miembros: roomMembers(r).map((c) => `${c.username} (${c.state})`),
+            porVolver: r.returning.size,
             objetos: r.objects.size,
         }));
         sendJson(res, 200, { conectados: online, salas: roomList, registro: logLines.slice(-80) });
@@ -442,7 +524,10 @@ setInterval(() => {
         }
     }
     for (const [id, room] of rooms) {
-        if (room.members.size === 0 && room.emptySince && t - room.emptySince > ROOM_EMPTY_TTL_MS) {
+        if (room.members.size > 0 || !room.emptySince) continue;
+        const ttl = room.returning.size > 0 ? ROOM_RETURN_TTL_MS : ROOM_EMPTY_TTL_MS;
+        if (t - room.emptySince > ttl) {
+            log(`sala ${id} cerrada (vacía)`);
             rooms.delete(id);
         }
     }
