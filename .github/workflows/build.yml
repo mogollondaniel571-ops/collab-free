@@ -1,38 +1,53 @@
-name: Compilar mod
+name: Compilar Collab Free
 
 on:
   workflow_dispatch:
   push:
     branches:
       - "**"
+    paths:
+      - "mod/**"
+      - ".github/workflows/build.yml"
 
 jobs:
   build:
-    name: ${{ matrix.mod.name }}
-    runs-on: windows-latest
     strategy:
       fail-fast: false
       matrix:
-        mod:
-          - name: Collab Free
-            path: mod
-            artifact: collab-free-mod
-          - name: Importador de Mods
-            path: importer
-            artifact: importador-mods
+        config:
+          - name: Windows
+            os: windows-latest
+            target: Win64
+          - name: Android32
+            os: ubuntu-latest
+            target: Android32
+          - name: Android64
+            os: ubuntu-latest
+            target: Android64
+    name: ${{ matrix.config.name }}
+    runs-on: ${{ matrix.config.os }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Compilar el mod
-        id: build
         uses: geode-sdk/build-geode-mod@main
         with:
-          path: ${{ matrix.mod.path }}
+          path: mod
           sdk: given
-          target: Win64
+          combine: true
+          target: ${{ matrix.config.target }}
+
+  package:
+    name: Juntar Windows + Android
+    runs-on: ubuntu-latest
+    needs: ["build"]
+    steps:
+      - name: Combinar
+        uses: geode-sdk/build-geode-mod/combine@main
+        id: build
 
       - name: Subir el .geode
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.mod.artifact }}
+          name: collab-free-mod
           path: ${{ steps.build.outputs.build-output }}
