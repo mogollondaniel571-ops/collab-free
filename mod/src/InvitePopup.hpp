@@ -27,6 +27,7 @@ protected:
     // sala
     void onStart(cocos2d::CCObject*);
     void onLeave(cocos2d::CCObject*);
+    void buildMembers();
 
     // amigos
     void loadFriends();
@@ -50,7 +51,11 @@ protected:
     cocos2d::CCNode* m_startNode = nullptr;
     cocos2d::CCNode* m_roomNode = nullptr;
     cocos2d::CCLabelBMFont* m_status = nullptr;
-    cocos2d::CCLabelBMFont* m_membersLabel = nullptr;
+    cocos2d::CCLabelBMFont* m_membersTitle = nullptr;
+    cocos2d::CCNode* m_membersList = nullptr;
+    std::string m_membersSig;
+    cocos2d::CCLabelBMFont* m_startInfo = nullptr;
+    CCMenuItemSpriteExtra* m_leaveOtherBtn = nullptr;
     geode::ScrollLayer* m_list = nullptr;
     geode::TextInput* m_nameInput = nullptr;
     CCMenuItemSpriteExtra* m_startBtn = nullptr;
