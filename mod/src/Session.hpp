@@ -35,6 +35,14 @@ class Session {
 public:
     static Session& get();
 
+    /// ¿Este editor está en la escena actual (o en la transición)? No toca el puntero.
+    static bool editorInScene(LevelEditorLayer* editor);
+    /// El editor abierto ahora mismo (según la escena), o nullptr.
+    static LevelEditorLayer* currentEditor();
+    /// ¿Estás jugando un nivel?
+    static bool playingLevel();
+    static bool inTransition();
+
     void init();        // conecta los eventos de la red
     void tick(float dt);
 
@@ -54,7 +62,7 @@ public:
     /// Acepta una invitación: descarga el nivel y abre el editor.
     void join(Invite const& invite);
     /// Sale de la sala (no borra nada del nivel).
-    void leave(bool notifyServer = true);
+    void leave(bool notifyServer = true, std::string const& reason = "");
 
     // --- ganchos del editor
     /// Se llama al terminar LevelEditorLayer::init.
@@ -76,6 +84,9 @@ private:
     void flushOps();
     void applyRemoteOps(std::vector<matjson::Value> const& ops);
     void applySnapshot(matjson::Value const& snap);
+    std::string settingsString(LevelEditorLayer* ed);
+    void applyHeader(std::string const& header);
+    void checkHeader(float dt);
     GameObject* createLocal(std::string const& id, std::string const& str);
     void removeLocal(GameObject* obj);
     void forgetAllObjects();
@@ -144,6 +155,12 @@ private:
 
     std::deque<Invite> m_invites;
     bool m_invitePopupOpen = false;
+    std::optional<Invite> m_pendingJoin; // aceptada estando en el editor
+    std::string m_notifiedInvite;        // para no repetir el aviso
+
+    std::string m_lastHeader;  // ajustes del nivel enviados/recibidos
+    float m_headerTimer = 0.f;
+    float m_exitTimer = 0.f;
 };
 
 } // namespace collab

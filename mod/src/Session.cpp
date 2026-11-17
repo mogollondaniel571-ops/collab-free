@@ -38,12 +38,53 @@ void Session::init() {
     Net::get().onReconnected = [this] { this->onReconnected(); };
 }
 
+// ------------------------------------------------------------------ escenas
+
+// Se busca el nodo entre los hijos de la escena sin tocar el puntero,
+// así no hay problema si ese editor ya se borró.
+static bool sceneContains(CCScene* scene, CCNode* node) {
+    if (!scene || !node || !scene->getChildren()) return false;
+    for (auto child : CCArrayExt<CCNode*>(scene->getChildren())) {
+        if (child == node) return true;
+    }
+    return false;
+}
+
+bool Session::inTransition() {
+    return typeinfo_cast<CCTransitionScene*>(CCDirector::get()->getRunningScene()) != nullptr;
+}
+
+bool Session::editorInScene(LevelEditorLayer* editor) {
+    if (!editor) return false;
+    auto scene = CCDirector::get()->getRunningScene();
+    if (auto t = typeinfo_cast<CCTransitionScene*>(scene)) {
+        return sceneContains(t->m_pInScene, editor) || sceneContains(t->m_pOutScene, editor);
+    }
+    return sceneContains(scene, editor);
+}
+
+LevelEditorLayer* Session::currentEditor() {
+    auto scene = CCDirector::get()->getRunningScene();
+    if (!scene || typeinfo_cast<CCTransitionScene*>(scene)) return nullptr;
+    return scene->getChildByType<LevelEditorLayer>(0);
+}
+
+bool Session::playingLevel() {
+    auto scene = CCDirector::get()->getRunningScene();
+    if (!scene) return false;
+    if (auto t = typeinfo_cast<CCTransitionScene*>(scene)) {
+        return (t->m_pInScene && t->m_pInScene->getChildByType<PlayLayer>(0))
+            || (t->m_pOutScene && t->m_pOutScene->getChildByType<PlayLayer>(0));
+    }
+    return scene->getChildByType<PlayLayer>(0) != nullptr;
+}
+
 // ------------------------------------------------------------------ utilidades
 
 LevelEditorLayer* Session::editor() const {
     if (!m_editor) return nullptr;
-    // si el editor ya no es el que está abierto, se considera cerrado
-    if (LevelEditorLayer::get() != m_editor) return nullptr;
+    // solo se usa si sigue en la escena (si no, pudo haberse borrado)
+    if (!editorInScene(m_editor)) return nullptr;
     return m_editor;
 }
 
@@ -145,7 +186,8 @@ void Session::host(LevelEditorLayer* editor, std::function<void(bool, std::strin
 
     auto body = matjson::Value::object();
     body["levelName"] = editor->m_level ? std::string(editor->m_level->m_levelName) : std::string("Nivel");
-    body["header"] = levelHeader(editor);
+    m_lastHeader = this->settingsString(editor);
+    body["header"] = m_lastHeader.empty() ? levelHeader(editor) : m_lastHeader;
     body["objects"] = std::move(objects);
 
     net.call("/room/create", std::move(body), [this, editor, done](JsonResult res) {
@@ -156,7 +198,7 @@ void Session::host(LevelEditorLayer* editor, std::function<void(bool, std::strin
             done(false, res.unwrapErr());
             return;
         }
-        if (LevelEditorLayer::get() != editor) {
+        if (!editorInScene(editor)) {
             // cerraste el editor mientras se creaba
             this->forgetAllObjects();
             m_editor = nullptr;
@@ -202,7 +244,7 @@ void Session::invite(int accountID, std::string const& username, std::function<v
 
 void Session::join(Invite const& invite) {
     if (m_busy) return;
-    if (m_active) this->leave();
+    if (m_active) this->leave(true, "aceptaste otra invitación");
     m_busy = true;
 
     auto body = matjson::Value::object();
@@ -215,7 +257,7 @@ void Session::join(Invite const& invite) {
             FLAlertLayer::create("Collab", res.unwrapErr(), "OK")->show();
             return;
         }
-        if (PlayLayer::get() || LevelEditorLayer::get()) {
+        if (playingLevel() || currentEditor()) {
             FLAlertLayer::create("Collab", "Sal del nivel antes de unirte.", "OK")->show();
             Net::get().call("/room/leave", matjson::Value::object(), nullptr);
             return;
@@ -247,7 +289,7 @@ void Session::join(Invite const& invite) {
 bool Session::onEditorCreated(LevelEditorLayer* editor, GJGameLevel* level) {
     // abrir otro editor mientras estabas en una sala = salir de la sala
     if (m_active && editor != m_editor) {
-        this->leave();
+        this->leave(true, "abriste otro editor");
     }
 
     if (m_joinSnapshot && m_joinLevel && m_joinLevel.data() == level) {
@@ -277,8 +319,9 @@ bool Session::onEditorCreated(LevelEditorLayer* editor, GJGameLevel* level) {
 
 // ------------------------------------------------------------------ salir
 
-void Session::leave(bool notifyServer) {
+void Session::leave(bool notifyServer, std::string const& reason) {
     if (!m_active && !m_busy && !m_joining) return;
+    log::info("Collab: saliendo de la sala ({})", reason.empty() ? "sin razón" : reason);
     if (notifyServer && Net::get().isReady()) {
         Net::get().call("/room/leave", matjson::Value::object(), nullptr);
     }
@@ -302,7 +345,8 @@ void Session::leave(bool notifyServer) {
     m_joinSnapshot.reset();
     m_joinLevel = nullptr;
     m_earlyEvents.clear();
-    log::info("Collab: saliste de la sala");
+    m_lastHeader.clear();
+    m_exitTimer = 0.f;
 }
 
 // ------------------------------------------------------------------ eventos
@@ -502,7 +546,7 @@ void Session::flushOps() {
         if (m_sendFails >= 10) {
             FLAlertLayer::create("Collab",
                 "Se perdió la conexión con la sala. Tus cambios siguen en tu nivel.", "OK")->show();
-            this->leave(false);
+            this->leave(false, "no se pudieron enviar cambios");
             return;
         }
         m_sendRetry = std::min(1.f * m_sendFails, 5.f);
@@ -553,6 +597,11 @@ void Session::applyRemoteOps(std::vector<matjson::Value> const& ops) {
         auto it = m_byId.find(id);
         GameObject* existing = it != m_byId.end() ? it->second.data() : nullptr;
 
+        if (t == "h") {
+            this->applyHeader(jstr(op, "s"));
+            continue;
+        }
+
         if (t == "a" || t == "m") {
             auto s = jstr(op, "s");
             if (existing) {
@@ -582,6 +631,10 @@ void Session::applyRemoteOps(std::vector<matjson::Value> const& ops) {
 void Session::applySnapshot(matjson::Value const& snap) {
     auto ed = this->editor();
     if (!ed) return;
+
+    // ajustes del nivel (colores, canción, etc.)
+    auto header = jstr(snap, "header");
+    if (!header.empty()) this->applyHeader(header);
 
     std::unordered_set<std::string> keep;
     for (auto const& pair : jarr(snap, "objects")) {
@@ -616,6 +669,49 @@ void Session::applySnapshot(matjson::Value const& snap) {
         ui->updateButtons();
         ui->updateObjectInfoLabel();
     }
+}
+
+// ------------------------------------------------------------------ ajustes del nivel
+
+std::string Session::settingsString(LevelEditorLayer* ed) {
+    if (!ed || !ed->m_levelSettings) return "";
+    return ed->m_levelSettings->getSaveString();
+}
+
+static bool syncSettingsEnabled() {
+    return Mod::get()->getSettingValue<bool>("sync-settings");
+}
+
+// Cada segundo: si cambiaste colores, canción, velocidad, etc., se envían.
+void Session::checkHeader(float dt) {
+    if (!syncSettingsEnabled()) return;
+    m_headerTimer += dt;
+    if (m_headerTimer < 1.f) return;
+    m_headerTimer = 0.f;
+    auto ed = this->editor();
+    if (!ed) return;
+    auto now = this->settingsString(ed);
+    if (now.empty() || now == m_lastHeader) return;
+    m_lastHeader = now;
+    this->queueOp('h', "__header__", &now);
+}
+
+void Session::applyHeader(std::string const& header) {
+    if (!syncSettingsEnabled() || header.empty()) return;
+    if (m_pending.contains("__header__")) return; // tu cambio va después
+    auto ed = this->editor();
+    if (!ed) return;
+    if (header == this->settingsString(ed)) {
+        m_lastHeader = header;
+        return;
+    }
+    // GD lee los ajustes desde la primera parte del texto del nivel
+    std::string setup = header + ";";
+    ed->createObjectsFromSetup(setup);
+    ed->levelSettingsUpdated();
+    ed->updateLevelColors();
+    m_lastHeader = this->settingsString(ed);
+    log::info("Collab: ajustes del nivel actualizados");
 }
 
 // ------------------------------------------------------------------ miembros y cursores
@@ -718,22 +814,38 @@ void Session::sendCursor() {
 
 void Session::showPendingInvite() {
     if (m_invites.empty() || m_invitePopupOpen || m_busy) return;
-    if (PlayLayer::get() || LevelEditorLayer::get()) return; // se muestra al salir del nivel
-    auto scene = CCDirector::get()->getRunningScene();
-    if (!scene || typeinfo_cast<CCTransitionScene*>(scene)) return;
+    if (inTransition()) return;
+
+    auto const& next = m_invites.front();
+    if (playingLevel()) {
+        // jugando: solo un aviso, la ventana sale cuando salgas del nivel
+        if (m_notifiedInvite != next.roomId) {
+            m_notifiedInvite = next.roomId;
+            notify(fmt::format("{} te invitó a Collab. Sal del nivel para responder.", next.fromName));
+        }
+        return;
+    }
 
     auto inv = m_invites.front();
     m_invites.pop_front();
     m_invitePopupOpen = true;
+    bool inEditor = currentEditor() != nullptr;
 
     createQuickPopup(
         "Invitación Collab",
-        fmt::format("<cy>{}</c> te invitó a editar <cg>{}</c> en tiempo real.\n¿Quieres unirte?",
-            inv.fromName, inv.levelName),
+        fmt::format("<cy>{}</c> te invitó a editar <cg>{}</c> en tiempo real.\n{}",
+            inv.fromName, inv.levelName,
+            inEditor ? "Cuando guardes y salgas del editor, entrarás a la sala." : "¿Quieres unirte?"),
         "Ahora no", "Unirme",
         [this, inv](FLAlertLayer*, bool accept) {
             m_invitePopupOpen = false;
-            if (accept) this->join(inv);
+            if (!accept) return;
+            if (currentEditor() || playingLevel()) {
+                m_pendingJoin = inv;
+                notify("Guarda y sal del editor para entrar a la sala");
+            } else {
+                this->join(inv);
+            }
         }
     );
 }
@@ -743,10 +855,19 @@ void Session::showPendingInvite() {
 void Session::tick(float dt) {
     if (!m_initialized) return;
     this->showPendingInvite();
+
+    // invitación aceptada estando en el editor: entrar apenas salga
+    if (m_pendingJoin && !m_active && !m_busy && !m_joining
+        && !inTransition() && !currentEditor() && !playingLevel()) {
+        auto inv = *m_pendingJoin;
+        m_pendingJoin.reset();
+        this->join(inv);
+    }
+
     if (m_joining && !m_active) {
         m_graceTimer += dt;
         if (m_graceTimer > 30.f) {
-            this->leave();
+            this->leave(true, "no se abrió el nivel de la sala");
             notify("No se pudo abrir el nivel de la sala", NotificationIcon::Error);
         }
         return;
@@ -754,24 +875,18 @@ void Session::tick(float dt) {
     if (!m_active) return;
 
     auto ed = this->editor();
-    // ¿saliste del editor? (cuando termina la transición, el editor ya no es la escena)
-    if (ed) {
-        auto running = CCDirector::get()->getRunningScene();
-        if (running && !typeinfo_cast<CCTransitionScene*>(running) && ed->getParent() != running) {
-            ed = nullptr;
-            m_snapshotToApply.reset();
-        }
-    }
     if (!ed) {
-        // el editor puede tardar un momento en quedar listo
-        if (m_snapshotToApply && m_graceTimer < 5.f) {
-            m_graceTimer += dt;
-            return;
+        // el editor puede tardar en aparecer en la escena; se espera un poco
+        // antes de decidir que saliste (así no te saca por un parpadeo)
+        m_exitTimer += dt;
+        float limit = m_snapshotToApply ? 8.f : 1.5f;
+        if (m_exitTimer > limit) {
+            this->leave(true, "el editor ya no está en pantalla");
+            notify("Saliste de la sala colaborativa");
         }
-        this->leave();
-        notify("Saliste de la sala colaborativa");
         return;
     }
+    m_exitTimer = 0.f;
 
     if (m_snapshotToApply) {
         auto snap = std::move(*m_snapshotToApply);
@@ -808,7 +923,7 @@ void Session::tick(float dt) {
             if (!res) {
                 FLAlertLayer::create("Collab",
                     "Se perdió la sala: " + res.unwrapErr() + "\nTus cambios siguen en tu nivel.", "OK")->show();
-                this->leave(false);
+                this->leave(false, "se perdió la sala");
                 return;
             }
             auto snap = res.unwrap();
@@ -826,6 +941,7 @@ void Session::tick(float dt) {
             m_deferred.pop_front();
             this->applyRemoteOps(ops);
         }
+        this->checkHeader(dt);
         m_scanTimer += dt;
         if (m_scanTimer >= SCAN_INTERVAL) {
             m_scanTimer = 0.f;

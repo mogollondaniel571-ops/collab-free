@@ -95,7 +95,7 @@ class $modify(CollabEditorUI, EditorUI) {
 // Espera a que termine la transición de entrada para mostrar la ventana.
 static void showInviteWhenReady(Ref<LevelEditorLayer> editor, int frames) {
     geode::queueInMainThread([editor, frames] {
-        if (LevelEditorLayer::get() != editor.data() || frames > 600) return;
+        if (!Session::editorInScene(editor.data()) || frames > 600) return;
         auto running = CCDirector::get()->getRunningScene();
         if (!running || typeinfo_cast<CCTransitionScene*>(running) || editor->getParent() != running) {
             showInviteWhenReady(editor, frames + 1);
@@ -122,11 +122,11 @@ class $modify(CollabLevelEditorLayer, LevelEditorLayer) {
 
 class $modify(CollabEditorPauseLayer, EditorPauseLayer) {
     void onSaveAndExit(CCObject* sender) {
-        Session::get().leave();
+        Session::get().leave(true, "guardar y salir");
         EditorPauseLayer::onSaveAndExit(sender);
     }
     void onSaveAndPlay(CCObject* sender) {
-        Session::get().leave();
+        Session::get().leave(true, "guardar y jugar");
         EditorPauseLayer::onSaveAndPlay(sender);
     }
 };

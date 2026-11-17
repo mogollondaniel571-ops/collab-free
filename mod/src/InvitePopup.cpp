@@ -183,7 +183,7 @@ void InvitePopup::update(float dt) {
 
 void InvitePopup::onStart(CCObject*) {
     if (Session::get().isActive()) return;
-    if (!m_editor || LevelEditorLayer::get() != m_editor) {
+    if (!m_editor || !Session::editorInScene(m_editor)) {
         this->setStatus("Abre el nivel en el editor primero.", {255, 120, 120});
         return;
     }
@@ -218,7 +218,7 @@ void InvitePopup::onLeave(CCObject*) {
         "Cancelar", "Salir",
         [self](FLAlertLayer*, bool yes) {
             if (!yes) return;
-            Session::get().leave();
+            Session::get().leave(true, "botón salir de la sala");
             self->onClose(nullptr);
         });
 }
