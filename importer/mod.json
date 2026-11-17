@@ -1,0 +1,11 @@
+{
+	"geode": "6.0.0-alpha.2",
+	"gd": {
+		"win": "2.2091"
+	},
+	"id": "daniel.importador-mods",
+	"name": "Importador de Mods",
+	"version": "v1.0.0",
+	"developer": "Daniel",
+	"description": "Un botón en el menú principal para importar archivos .geode rápido."
+}
