@@ -790,3 +790,10 @@ if (SELF_URL && typeof fetch === "function") {
 server.listen(PORT, () => {
     console.log(`Collab Free escuchando en el puerto ${PORT}`);
 });
+
+// Alvin, el bot de Discord (solo arranca si existe DISCORD_TOKEN)
+try {
+    require("./alvin").start();
+} catch (e) {
+    console.error("[alvin] no arrancó:", e.message);
+}
