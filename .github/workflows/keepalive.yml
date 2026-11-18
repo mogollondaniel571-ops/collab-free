@@ -1,0 +1,15 @@
+name: Mantener despierto el servidor
+
+# Render duerme el servidor gratis si nadie lo visita en 15 minutos.
+# Esto lo visita cada 10 minutos (además de que el servidor se visita a sí mismo).
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Visitar el servidor
+        run: curl -fsS --max-time 150 https://collab-free.onrender.com/ping || true
