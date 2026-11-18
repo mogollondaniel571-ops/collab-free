@@ -7,6 +7,8 @@
 #include <Geode/modify/EditLevelLayer.hpp>
 #include <Geode/modify/EditorPauseLayer.hpp>
 #include <Geode/modify/ProfilePage.hpp>
+#include <Geode/modify/LevelSettingsLayer.hpp>
+#include <Geode/binding/SongSelectNode.hpp>
 #include <Geode/binding/ButtonSprite.hpp>
 #include <Geode/binding/CCMenuItemSpriteExtra.hpp>
 #include <Geode/binding/GJAccountManager.hpp>
@@ -15,6 +17,7 @@
 #include "Session.hpp"
 #include "InvitePopup.hpp"
 #include "Invites.hpp"
+#include "RoomUI.hpp"
 
 using namespace geode::prelude;
 using namespace collab;
@@ -54,6 +57,10 @@ static CCNode* makeCollabSprite(float scale) {
 class $modify(CollabEditorUI, EditorUI) {
     struct Fields {
         CCMenuItemSpriteExtra* button = nullptr;
+        CCMenuItemSpriteExtra* chat = nullptr;
+        CCMenuItemSpriteExtra* ping = nullptr;
+        CCLabelBMFont* badge = nullptr;
+        CCLabelBMFont* loading = nullptr;
     };
 
     bool init(LevelEditorLayer* editor) {
@@ -70,8 +77,46 @@ class $modify(CollabEditorUI, EditorUI) {
         btn->setID("collab-button"_spr);
         btn->setPosition({winSize.width - 105.f, winSize.height - 22.f});
         menu->addChild(btn);
+
+        // chat de la sala (con número de mensajes sin leer)
+        auto chatSpr = CCSprite::createWithSpriteFrameName("GJ_chatBtn_001.png");
+        if (!chatSpr) chatSpr = CCSprite::createWithSpriteFrameName("accountBtn_messages_001.png");
+        chatSpr->setScale(0.5f);
+        auto badge = CCLabelBMFont::create("", "bigFont.fnt");
+        badge->setScale(0.7f);
+        badge->setColor({255, 90, 90});
+        badge->setPosition({chatSpr->getContentSize().width - 2.f, chatSpr->getContentSize().height - 2.f});
+        chatSpr->addChild(badge, 5);
+        auto chatBtn = CCMenuItemSpriteExtra::create(chatSpr, this, menu_selector(CollabEditorUI::onCollabChat));
+        chatBtn->setID("collab-chat"_spr);
+        chatBtn->setPosition({winSize.width - 137.f, winSize.height - 22.f});
+        menu->addChild(chatBtn);
+
+        // "mira aquí": marca el centro de tu pantalla para todos
+        auto pingLabel = CCLabelBMFont::create("!", "bigFont.fnt");
+        auto pingSpr = CCSprite::createWithSpriteFrameName("GJ_button_02.png");
+        if (pingSpr) {
+            pingSpr->setScale(0.42f);
+            pingLabel->setPosition(pingSpr->getContentSize() / 2);
+            pingSpr->addChild(pingLabel);
+        }
+        CCNode* pingNode = pingSpr ? static_cast<CCNode*>(pingSpr) : static_cast<CCNode*>(pingLabel);
+        auto pingBtn = CCMenuItemSpriteExtra::create(pingNode, this, menu_selector(CollabEditorUI::onCollabPing));
+        pingBtn->setID("collab-ping"_spr);
+        pingBtn->setPosition({winSize.width - 167.f, winSize.height - 22.f});
+        menu->addChild(pingBtn);
+
+        auto loading = CCLabelBMFont::create("", "goldFont.fnt");
+        loading->setScale(0.45f);
+        loading->setPosition({winSize.width / 2, winSize.height - 60.f});
+        menu->addChild(loading);
+
         this->addChild(menu, 20);
         m_fields->button = btn;
+        m_fields->chat = chatBtn;
+        m_fields->ping = pingBtn;
+        m_fields->badge = badge;
+        m_fields->loading = loading;
 
         this->schedule(schedule_selector(CollabEditorUI::updateCollabButton), 0.5f);
         return true;
@@ -83,8 +128,27 @@ class $modify(CollabEditorUI, EditorUI) {
         auto spr = typeinfo_cast<CCSprite*>(btn->getNormalImage());
         if (!spr) return;
         // verde cuando estás en una sala
-        bool active = Session::get().isInEditor(m_editorLayer);
+        auto& s = Session::get();
+        bool active = s.isInEditor(m_editorLayer);
         spr->setColor(active ? ccColor3B{120, 255, 140} : ccColor3B{255, 255, 255});
+        if (m_fields->chat) m_fields->chat->setVisible(active);
+        if (m_fields->ping) m_fields->ping->setVisible(active && !s.isViewer());
+        if (m_fields->badge) {
+            int unread = s.unreadChat();
+            m_fields->badge->setString(unread > 0 ? fmt::format("{}", std::min(unread, 99)).c_str() : "");
+        }
+        if (m_fields->loading) {
+            int pct = active ? s.loadingPercent() : -1;
+            m_fields->loading->setString(pct >= 0 ? fmt::format("Cargando la sala... {}%", pct).c_str() : "");
+        }
+    }
+
+    void onCollabChat(CCObject*) {
+        if (auto popup = ChatPopup::create()) popup->show();
+    }
+
+    void onCollabPing(CCObject*) {
+        Session::get().sendPing();
     }
 
     void onCollab(CCObject*) {
@@ -140,6 +204,32 @@ class $modify(CollabEditorPauseLayer, EditorPauseLayer) {
     void onExitNoSave(CCObject* sender) {
         Session::get().beforeEditorExit(m_editorLayer);
         EditorPauseLayer::onExitNoSave(sender);
+    }
+};
+
+// ------------------------------------------------------------------ ventana de ajustes del nivel
+
+// Si tienes los ajustes abiertos mientras otro cambia la canción, al cerrarlos
+// no se pisa la canción nueva con la vieja (a menos que tú la hayas cambiado).
+class $modify(CollabLevelSettingsLayer, LevelSettingsLayer) {
+    struct Fields {
+        float openedAt = 0.f;
+    };
+
+    bool init(LevelSettingsObject* object, LevelEditorLayer* layer) {
+        m_fields->openedAt = Session::get().clock();
+        return LevelSettingsLayer::init(object, layer);
+    }
+
+    void onClose(CCObject* sender) {
+        auto editor = m_editorLayer;
+        bool touched = m_songSelectNode && m_songSelectNode->m_songChanged;
+        auto& session = Session::get();
+        bool watch = editor && session.isInEditor(editor);
+        auto before = watch ? session.metaNow(editor) : std::string();
+        auto openedAt = m_fields->openedAt;
+        LevelSettingsLayer::onClose(sender);
+        if (watch) session.settingsLayerClosed(editor, before, touched, openedAt);
     }
 };
 
