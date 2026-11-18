@@ -1875,7 +1875,7 @@ void Session::clearCache() {
     m_cacheAllowed.clear();
     m_cacheViewers.clear();
     m_cacheDirty = false;
-    (void)asp::fs::remove(cachePath());
+    (void)geode::utils::file::writeStringSafe(cachePath(), "{}");
 }
 
 void Session::tryRevive() {
