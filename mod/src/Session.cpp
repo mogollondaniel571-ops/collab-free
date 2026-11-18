@@ -10,19 +10,28 @@
 #include <Geode/binding/LocalLevelManager.hpp>
 #include <Geode/binding/PlayLayer.hpp>
 #include <Geode/binding/PlayerObject.hpp>
+#include <Geode/binding/UndoObject.hpp>
+#include <Geode/binding/GameObjectCopy.hpp>
 #include <Geode/ui/Notification.hpp>
 #include <Geode/ui/Popup.hpp>
 #include <Geode/utils/cocos.hpp>
 #include <Geode/utils/random.hpp>
+#include <Geode/utils/file.hpp>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <thread>
 
 using namespace geode::prelude;
 
 namespace collab {
 
 // cada cuánto se revisan los cambios (segundos)
-static constexpr float SCAN_INTERVAL = 0.2f;
+static constexpr float SCAN_INTERVAL = 0.25f;
 // cuántos objetos "no seleccionados" se revisan por vuelta en niveles grandes
-static constexpr size_t SCAN_CHUNK = 1500;
+static constexpr size_t SCAN_CHUNK = 1000;
+// si tienes muchísimos objetos seleccionados, se revisan por partes
+static constexpr size_t SELECTED_FULL_LIMIT = 400;
 // máximo de cambios por envío
 static constexpr size_t MAX_OPS_PER_SEND = 3000;
 static constexpr float CURSOR_INTERVAL = 0.1f;
@@ -30,6 +39,15 @@ static constexpr float PLAYER_INTERVAL = 1.f / 15.f;
 static constexpr float SETTINGS_INTERVAL = 0.4f;
 // segundos que la ventanita de invitación se queda en pantalla
 static constexpr float ALERT_SECONDS = 15.f;
+// objetos que se crean o revisan por frame al cargar una sala grande
+static constexpr size_t LOAD_CHUNK = 2000;
+static constexpr size_t MAX_SELECTION_SENT = 400;
+static constexpr size_t MAX_SELECTION_DRAWN = 300;
+
+static int64_t nowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
 
 static void notify(std::string const& text, NotificationIcon icon = NotificationIcon::Info) {
     Notification::create(text, icon, 2.5f)->show();
@@ -192,12 +210,30 @@ static GJGameLevel* findLocalLevel(std::string const& name) {
 void Session::onHello(matjson::Value const& data, bool reconnect) {
     bool serverHasRoom = data.contains("room") && data["room"].isObject();
 
+    // invitaciones que te llegaron mientras no estabas
+    int added = 0;
+    for (auto const& iv : jarr(data, "invites")) {
+        Invite inv;
+        inv.roomId = jstr(iv, "roomId");
+        inv.levelName = jstr(iv, "levelName");
+        inv.fromName = iv.contains("from") ? jstr(iv["from"], "username") : "Alguien";
+        if (inv.roomId.empty() || (m_active && inv.roomId == m_roomId)) continue;
+        bool known = std::any_of(m_inbox.begin(), m_inbox.end(),
+            [&](Invite const& i) { return i.roomId == inv.roomId; });
+        if (!known) {
+            m_inbox.push_back(inv);
+            m_alertQueue.push_back(inv);
+            added++;
+        }
+    }
+    if (added > 0) {
+        notify(fmt::format("Tienes {} invitación(es) Collab guardada(s) en tu perfil", added));
+    }
+
     if (m_active) {
         if (!serverHasRoom) {
-            // el servidor se reinició o se durmió: la sala ya no existe
-            this->leave(false, "la sala ya no existe en el servidor");
-            FLAlertLayer::create("Collab",
-                "La sala se cerró (el servidor se reinició).\nTus cambios siguen en tu copia del nivel.", "OK")->show();
+            // el servidor se reinició: se revive la sala con tu copia
+            this->tryRevive();
             return;
         }
         // se cortó la conexión: pedir la copia de la sala otra vez
@@ -210,31 +246,42 @@ void Session::onHello(matjson::Value const& data, bool reconnect) {
     if (serverHasRoom) {
         // seguías en una sala (cerraste el juego o se cortó el internet)
         auto const& room = data["room"];
-        m_roomId = jstr(room, "roomId");
-        m_levelName = jstr(room, "levelName");
-        m_ownerId = jstr(room, "owner");
-        m_active = true;
-        m_editor = nullptr;
-        m_colorIndex = 0;
-        this->setMembers(jarr(room, "members"));
-        auto savedRoom = Mod::get()->getSavedValue<std::string>("room-id");
-        auto savedLevel = Mod::get()->getSavedValue<std::string>("room-level");
-        m_roomLevel = savedRoom == m_roomId ? findLocalLevel(savedLevel) : nullptr;
-        m_sentState.clear();
-        log::info("Collab: sigues en la sala {}", m_roomId);
-        if (m_roomLevel) {
-            notify(fmt::format("Sigues en la sala de \"{}\". Abre el nivel para seguir editando.", m_levelName));
-        } else {
-            notify(fmt::format("Sigues en la sala de \"{}\", pero no encontré tu copia del nivel.", m_levelName),
-                NotificationIcon::Warning);
-        }
+        this->becomeAway(jstr(room, "roomId"), jstr(room, "levelName"), jstr(room, "owner"), jarr(room, "members"));
         return;
     }
 
     auto saved = Mod::get()->getSavedValue<std::string>("room-id");
     if (!saved.empty()) {
-        saveRoomInfo("", "");
-        notify("Tu sala anterior se cerró. Tu copia del nivel sigue en tus niveles.", NotificationIcon::Warning);
+        if (this->loadCache(saved)) {
+            // la sala se perdió al reiniciarse el servidor: se revive con tu copia
+            m_roomId = saved;
+            this->tryRevive();
+        } else {
+            saveRoomInfo("", "");
+            notify("Tu sala anterior se cerró. Tu copia del nivel sigue en tus niveles.", NotificationIcon::Warning);
+        }
+    }
+}
+
+void Session::becomeAway(std::string const& roomId, std::string const& levelName,
+    std::string const& owner, std::vector<matjson::Value> const& members) {
+    m_roomId = roomId;
+    m_levelName = levelName;
+    m_ownerId = owner;
+    m_active = true;
+    m_editor = nullptr;
+    m_colorIndex = 0;
+    this->setMembers(members);
+    auto savedRoom = Mod::get()->getSavedValue<std::string>("room-id");
+    auto savedLevel = Mod::get()->getSavedValue<std::string>("room-level");
+    m_roomLevel = savedRoom == m_roomId ? findLocalLevel(savedLevel) : nullptr;
+    m_sentState.clear();
+    log::info("Collab: sigues en la sala {}", m_roomId);
+    if (m_roomLevel) {
+        notify(fmt::format("Sigues en la sala de \"{}\". Abre el nivel para seguir editando.", m_levelName));
+    } else {
+        notify(fmt::format("Sigues en la sala de \"{}\", pero no encontré tu copia del nivel.", m_levelName),
+            NotificationIcon::Warning);
     }
 }
 
@@ -317,6 +364,17 @@ void Session::host(LevelEditorLayer* editor, std::function<void(bool, std::strin
         me["state"] = "edit";
         this->addMember(me);
         saveRoomInfo(m_roomId, m_levelName);
+        m_viewer = false;
+        // copia local de la sala
+        m_cacheRoom = m_roomId;
+        m_cacheLevelName = m_levelName;
+        m_cacheObjs.clear();
+        for (auto& [ptr, info] : m_byPtr) m_cacheObjs[info.id] = info.str;
+        m_cacheHeader = m_lastHeader;
+        m_cacheMeta = m_lastMeta;
+        m_cacheAllowed = { GJAccountManager::sharedState()->m_accountID };
+        m_cacheViewers.clear();
+        this->cacheTouch();
         log::info("Collab: sala {} creada", m_roomId);
         done(true, "");
     }, 240);
@@ -329,7 +387,7 @@ void Session::invite(int accountID, std::string const& username, std::function<v
     }
     auto body = matjson::Value::object();
     if (accountID > 0) body["accountID"] = accountID;
-    else body["username"] = username;
+    body["username"] = username;
     Net::get().call("/room/invite", std::move(body), [done](JsonResult res) {
         if (!res) {
             done(false, res.unwrapErr());
@@ -339,6 +397,8 @@ void Session::invite(int accountID, std::string const& username, std::function<v
         auto name = jstr(data, "username");
         if (data.contains("busy") && data["busy"].asBool().unwrapOr(false)) {
             name += " (está en otra sala; le queda guardada)";
+        } else if (data.contains("offline") && data["offline"].asBool().unwrapOr(false)) {
+            name += " (no está conectado; le llegará al abrir el juego)";
         }
         done(true, name);
     });
@@ -417,6 +477,7 @@ void Session::join(Invite const& invite) {
         m_ownerId = jstr(snap, "owner");
         m_joinSnapshot = snap;
         m_joinLevel = level;
+        this->cacheFromSnapshot(snap);
         m_joining = true;
         m_graceTimer = 0.f;
         m_earlyEvents.clear();
@@ -431,9 +492,14 @@ void Session::clearMemberNodes() {
     for (auto& [id, m] : m_members) {
         if (m.cursor) m.cursor->removeFromParent();
         if (m.ghost) m.ghost->removeFromParent();
+        if (m.selDraw) m.selDraw->removeFromParent();
         m.hasCursor = false;
         m.ghostOn = false;
     }
+    for (auto& mk : m_markers) {
+        if (mk.node) mk.node->removeFromParent();
+    }
+    m_markers.clear();
 }
 
 bool Session::onEditorCreated(LevelEditorLayer* editor, GJGameLevel* level) {
@@ -506,6 +572,7 @@ void Session::beforeEditorExit(LevelEditorLayer* editor) {
         Net::get().call("/room/ops", std::move(body), nullptr);
         m_outOps.clear();
     }
+    this->saveCache(true);
 }
 
 // ------------------------------------------------------------------ salir
@@ -523,7 +590,11 @@ void Session::detach(bool notifyUser) {
     m_sending = false;
     m_sendRetry = -1.f;
     m_snapshotToApply.reset();
+    m_job.reset();
     m_waitingSnapshot = false;
+    m_selSig.clear();
+    m_selPending.reset();
+    this->saveCache(true);
     m_needResync = false;
     m_earlyEvents.clear();
     m_playerSentOn = false;
@@ -566,7 +637,16 @@ void Session::leave(bool notifyServer, std::string const& reason) {
     m_lastMeta.clear();
     m_sentState.clear();
     m_exitTimer = 0.f;
+    m_job.reset();
+    m_chat.clear();
+    m_unread = 0;
+    m_viewer = false;
+    m_selSig.clear();
+    m_selPending.reset();
+    m_reviving = false;
+    m_reviveRetry = -1.f;
     saveRoomInfo("", "");
+    this->clearCache();
 }
 
 // ------------------------------------------------------------------ eventos
@@ -580,11 +660,36 @@ void Session::onEvent(matjson::Value const& ev) {
         inv.levelName = jstr(ev, "levelName");
         inv.fromName = ev.contains("from") ? jstr(ev["from"], "username") : "Alguien";
         if (inv.roomId == m_roomId && m_active) return;
-        for (auto const& i : m_inbox) {
-            if (i.roomId == inv.roomId) return;
-        }
-        m_inbox.push_back(inv);
-        m_alertQueue.push_back(inv);
+        log::info("Collab: invitación de {} a la sala {}", inv.fromName, inv.roomId);
+        bool known = std::any_of(m_inbox.begin(), m_inbox.end(),
+            [&](Invite const& i) { return i.roomId == inv.roomId; });
+        if (!known) m_inbox.push_back(inv);
+        // aunque ya estuviera guardada, se vuelve a mostrar la ventanita
+        bool queued = std::any_of(m_alertQueue.begin(), m_alertQueue.end(),
+            [&](Invite const& i) { return i.roomId == inv.roomId; });
+        bool showing = m_alert && m_alert->roomId == inv.roomId;
+        if (!queued && !showing) m_alertQueue.push_back(inv);
+        if (showing) m_alertLeft = ALERT_SECONDS;
+        m_notifiedInvite.clear();
+        return;
+    }
+
+    if (type == "revived" && !m_active && !m_joining) {
+        // otro de la sala la revivió: vuelves a ella ("fuera del editor")
+        auto roomId = jstr(ev, "roomId");
+        this->becomeAway(roomId, jstr(ev, "levelName"), "", {});
+        auto body = matjson::Value::object();
+        Net::get().call("/room/info", std::move(body), [this, roomId](JsonResult res) {
+            if (!res || !m_active || m_roomId != roomId) return;
+            auto data = res.unwrap();
+            if (!data.contains("room") || !data["room"].isObject()) return;
+            m_ownerId = jstr(data["room"], "owner");
+            this->setMembers(jarr(data["room"], "members"));
+        });
+        return;
+    }
+    if (type == "kicked") {
+        if (m_active && jstr(ev, "roomId") == m_roomId) this->handleKicked(jstr(ev, "by"));
         return;
     }
 
@@ -593,7 +698,7 @@ void Session::onEvent(matjson::Value const& ev) {
         return;
     }
     if (!m_active) return;
-    if (m_waitingSnapshot || m_snapshotToApply) {
+    if (m_waitingSnapshot || m_snapshotToApply || m_job) {
         m_earlyEvents.push_back(ev);
         return;
     }
@@ -601,6 +706,7 @@ void Session::onEvent(matjson::Value const& ev) {
     if (type == "ops") {
         auto from = jstr(ev, "from");
         auto ops = jarr(ev, "ops");
+        this->cacheApplyOps(ops);
         if (from == Net::get().clientId()) {
             // eco de lo que enviamos: ya no está pendiente
             for (auto const& op : ops) {
@@ -614,7 +720,73 @@ void Session::onEvent(matjson::Value const& ev) {
         if (this->isPlaytesting() || !m_deferred.empty()) {
             m_deferred.push_back(std::move(ops));
         } else {
-            this->applyRemoteOps(ops);
+            auto mit = m_members.find(from);
+            this->applyRemoteOps(ops, mit != m_members.end() ? mit->second.username : "");
+        }
+    }
+    else if (type == "chat") {
+        ChatMsg msg;
+        msg.from = jstr(ev, "from");
+        msg.username = jstr(ev, "username");
+        msg.text = jstr(ev, "text");
+        auto mit = m_members.find(msg.from);
+        if (mit != m_members.end()) msg.color = mit->second.color;
+        m_chat.push_back(msg);
+        if (m_chat.size() > 80) m_chat.pop_front();
+        if (!m_chatOpen && msg.from != Net::get().clientId()) {
+            m_unread++;
+            notify(fmt::format("{}: {}", msg.username, msg.text));
+        }
+    }
+    else if (type == "ping") {
+        ChatMsg msg;
+        msg.from = jstr(ev, "from");
+        msg.username = jstr(ev, "username");
+        msg.ping = true;
+        msg.pos = ccp(jnum(ev, "x"), jnum(ev, "y"));
+        msg.text = "marcó un lugar";
+        auto mit = m_members.find(msg.from);
+        if (mit != m_members.end()) msg.color = mit->second.color;
+        m_chat.push_back(msg);
+        if (m_chat.size() > 80) m_chat.pop_front();
+        this->addMarker(msg.pos, msg.username, msg.color);
+        if (msg.from != Net::get().clientId()) {
+            if (!m_chatOpen) m_unread++;
+            notify(fmt::format("{} marcó un lugar (en el chat puedes ir)", msg.username));
+        }
+    }
+    else if (type == "select") {
+        auto mit = m_members.find(jstr(ev, "from"));
+        if (mit != m_members.end()) {
+            mit->second.selected.clear();
+            for (auto const& id : jarr(ev, "ids")) {
+                if (id.isString()) mit->second.selected.push_back(id.asString().unwrap());
+            }
+        }
+    }
+    else if (type == "owner") {
+        auto owner = jstr(ev, "owner");
+        m_ownerId = owner;
+        if (owner == Net::get().clientId()) {
+            m_viewer = false;
+            notify("Ahora eres el anfitrión de la sala", NotificationIcon::Success);
+        } else if (ev.contains("member")) {
+            notify(fmt::format("{} ahora es el anfitrión", jstr(ev["member"], "username")));
+        }
+    }
+    else if (type == "role") {
+        auto id = jstr(ev, "client");
+        bool viewer = ev.contains("viewer") && ev["viewer"].asBool().unwrapOr(false);
+        auto mit = m_members.find(id);
+        if (mit != m_members.end()) mit->second.viewer = viewer;
+        if (id == Net::get().clientId()) {
+            m_viewer = viewer;
+            notify(viewer ? "El anfitrión te puso en modo solo mirar" : "El anfitrión te dejó editar otra vez",
+                viewer ? NotificationIcon::Warning : NotificationIcon::Success);
+        }
+        if (mit != m_members.end()) {
+            if (viewer) m_cacheViewers.push_back(mit->second.accountID);
+            else std::erase(m_cacheViewers, mit->second.accountID);
         }
     }
     else if (type == "cursor") {
@@ -702,6 +874,11 @@ void Session::scan() {
             for (auto obj : CCArrayExt<GameObject*>(ui->m_selectedObjects)) selected.insert(obj);
         }
     }
+    this->updateSelection(selected);
+    if (m_viewer) {
+        this->viewerCheck(selected);
+        return;
+    }
 
     size_t count = ed->m_objects->count();
     bool fullScan = count <= SCAN_CHUNK;
@@ -723,7 +900,8 @@ void Session::scan() {
             bool inChunk = fullScan
                 || (index >= chunkStart && index < chunkEnd)
                 || (chunkEnd > count && index < chunkEnd - count);
-            if (inChunk || selected.contains(obj)) {
+            bool checkSelected = selected.size() <= SELECTED_FULL_LIMIT || (m_scanTick % 4) == 0;
+            if (inChunk || (checkSelected && selected.contains(obj))) {
                 auto str = this->saveString(obj);
                 if (str != it->second.str) {
                     it->second.str = str;
@@ -783,6 +961,14 @@ void Session::flushOps() {
             this->flushOps();
             return;
         }
+        if (res.unwrapErr().find("solo mirar") != std::string::npos) {
+            // no puedes editar: se deshacen tus cambios
+            m_viewer = true;
+            m_pending.clear();
+            m_outOps.clear();
+            this->requestSnapshot(true);
+            return;
+        }
         // se vuelve a intentar con los mismos cambios al principio de la fila
         m_outOps.insert(m_outOps.begin(),
             std::make_move_iterator(batch.begin()), std::make_move_iterator(batch.end()));
@@ -826,6 +1012,7 @@ void Session::removeLocal(GameObject* obj) {
     }
     // se guarda un rato por si alguna ventana todavía lo usa
     m_graveyard.push_back(keep);
+    m_removedForUndo.insert(obj);
     auto it = m_byPtr.find(obj);
     if (it != m_byPtr.end()) {
         auto id = it->second.id;
@@ -834,7 +1021,7 @@ void Session::removeLocal(GameObject* obj) {
     }
 }
 
-void Session::applyRemoteOps(std::vector<matjson::Value> const& ops) {
+void Session::applyRemoteOps(std::vector<matjson::Value> const& ops, std::string const& fromName) {
     auto ed = this->editor();
     if (!ed) return;
     bool changed = false;
@@ -861,6 +1048,11 @@ void Session::applyRemoteOps(std::vector<matjson::Value> const& ops) {
         // lo tienes seleccionado (o con su ventana de ajustes abierta): se aplica al soltarlo
         if (existing && isSelectedLocally(ed, existing)) {
             m_held[id] = op;
+            if (m_conflictCooldown <= 0.f && !fromName.empty()) {
+                m_conflictCooldown = 6.f;
+                notify(fmt::format("{} también está cambiando lo que tienes seleccionado", fromName),
+                    NotificationIcon::Warning);
+            }
             continue;
         }
         m_held.erase(id);
@@ -884,73 +1076,11 @@ void Session::applyRemoteOps(std::vector<matjson::Value> const& ops) {
     }
 
     if (changed) {
+        this->purgeUndo();
         if (auto ui = ed->m_editorUI) {
             ui->updateButtons();
             ui->updateObjectInfoLabel();
         }
-    }
-}
-
-void Session::applySnapshot(matjson::Value const& snap, bool removeUntracked) {
-    auto ed = this->editor();
-    if (!ed) return;
-
-    // ajustes del nivel (colores, fondo, velocidad...) y canción
-    auto header = jstr(snap, "header");
-    if (!header.empty()) this->applyHeader(header);
-    auto meta = jstr(snap, "meta");
-    if (!meta.empty()) this->applyMeta(meta);
-
-    // objetos que ya estaban en tu copia del nivel: se reutilizan si son iguales
-    std::unordered_multimap<std::string, GameObject*> untracked;
-    if (ed->m_objects) {
-        for (auto obj : CCArrayExt<GameObject*>(ed->m_objects)) {
-            if (!m_byPtr.contains(obj)) untracked.emplace(this->saveString(obj), obj);
-        }
-    }
-
-    std::unordered_set<std::string> keep;
-    for (auto const& pair : jarr(snap, "objects")) {
-        if (!pair.isArray()) continue;
-        auto const& arr = pair.asArray().unwrap();
-        if (arr.size() < 2) continue;
-        auto id = arr[0].asString().unwrapOr("");
-        auto str = arr[1].asString().unwrapOr("");
-        if (id.empty()) continue;
-        keep.insert(id);
-
-        auto it = m_byId.find(id);
-        if (it != m_byId.end()) {
-            auto ptr = it->second.data();
-            auto pit = m_byPtr.find(ptr);
-            if (pit != m_byPtr.end() && pit->second.str == str) continue;
-            this->removeLocal(ptr);
-        }
-        auto uit = untracked.find(str);
-        if (uit != untracked.end()) {
-            this->registerObject(id, uit->second, str);
-            untracked.erase(uit);
-            continue;
-        }
-        this->createLocal(id, str);
-    }
-
-    // lo que tú tenías y ya no existe en la sala
-    std::vector<GameObject*> remove;
-    for (auto& [id, obj] : m_byId) {
-        if (!keep.contains(id)) remove.push_back(obj.data());
-    }
-    if (removeUntracked) {
-        for (auto& [str, obj] : untracked) remove.push_back(obj);
-    }
-    for (auto obj : remove) this->removeLocal(obj);
-
-    m_pending.clear();
-    m_outOps.clear();
-    m_held.clear();
-    if (auto ui = ed->m_editorUI) {
-        ui->updateButtons();
-        ui->updateObjectInfoLabel();
     }
 }
 
@@ -985,10 +1115,12 @@ void Session::checkSettings(float dt) {
     auto ed = this->editor();
     if (!ed) return;
 
+    if (m_viewer) return;
     auto meta = this->metaString(ed);
     if (!meta.empty() && meta != m_lastMeta) {
         m_lastMeta = meta;
         this->queueOp('g', "__meta__", &meta);
+        log::info("Collab: enviando canción del nivel: {}", meta);
     }
 
     if (!syncSettingsEnabled()) return;
@@ -1014,10 +1146,13 @@ void Session::applyHeader(std::string const& header) {
         m_lastHeader = header;
         return;
     }
-    // GD lee los ajustes desde la primera parte del texto del nivel
+    // GD lee los ajustes desde la primera parte del texto del nivel.
+    // La canción no va ahí: se guarda antes y se repone después, por si GD la cambia.
+    auto metaBefore = this->metaString(ed);
     std::string setup = header + ";";
     ed->createObjectsFromSetup(setup);
     ed->levelSettingsUpdated();
+    if (!metaBefore.empty() && this->metaString(ed) != metaBefore) this->restoreMeta(ed, metaBefore);
 
     // fondo, piso y fondo del medio: se vuelven a crear si cambiaron
     if (auto s = ed->m_levelSettings) {
@@ -1037,12 +1172,26 @@ void Session::applyHeader(std::string const& header) {
     }
     ed->updateLevelColors();
     m_lastHeader = this->settingsString(ed);
+    m_lastMeta = this->metaString(ed);
     log::info("Collab: ajustes del nivel actualizados");
 }
 
 void Session::applyMeta(std::string const& meta) {
     if (meta.empty() || m_pending.contains("__meta__")) return;
     auto ed = this->editor();
+    if (!ed || !ed->m_level) return;
+    if (meta == this->metaString(ed)) {
+        m_lastMeta = meta;
+        return;
+    }
+    this->restoreMeta(ed, meta);
+    m_metaRemoteAt = m_clock;
+    log::info("Collab: canción del nivel actualizada: {}", meta);
+    notify("Cambiaron la canción del nivel");
+}
+
+// Pone la canción y los efectos de sonido tal cual vienen en el texto.
+void Session::restoreMeta(LevelEditorLayer* ed, std::string const& meta) {
     if (!ed || !ed->m_level) return;
     auto parsed = matjson::parse(meta);
     if (!parsed) return;
@@ -1052,9 +1201,33 @@ void Session::applyMeta(std::string const& meta) {
     level->m_songID = (int)jnum(v, "songID", level->m_songID);
     level->m_songIDs = jstr(v, "songIDs", std::string(level->m_songIDs));
     level->m_sfxIDs = jstr(v, "sfxIDs", std::string(level->m_sfxIDs));
+    if (ed->m_levelSettings && ed->m_levelSettings->m_level && ed->m_levelSettings->m_level != level) {
+        auto other = ed->m_levelSettings->m_level;
+        other->m_audioTrack = level->m_audioTrack;
+        other->m_songID = level->m_songID;
+        other->m_songIDs = level->m_songIDs;
+        other->m_sfxIDs = level->m_sfxIDs;
+    }
     m_lastMeta = this->metaString(ed);
-    ed->levelSettingsUpdated();
-    log::info("Collab: canción del nivel actualizada");
+}
+
+std::string Session::metaNow(LevelEditorLayer* ed) {
+    return this->metaString(ed);
+}
+
+// La ventana de ajustes del nivel se cerró. Si la tenías abierta mientras otro
+// cambiaba la canción y tú no la tocaste, se repone la canción nueva (si no,
+// la ventana escribiría la vieja encima).
+void Session::settingsLayerClosed(LevelEditorLayer* ed, std::string const& metaBefore, bool songTouched, float openedAt) {
+    if (!m_active || ed != m_editor || !this->editor()) return;
+    auto now = this->metaString(ed);
+    bool remoteWhileOpen = m_metaRemoteAt >= openedAt;
+    if (!songTouched && remoteWhileOpen && now != metaBefore && !m_lastMeta.empty()) {
+        this->restoreMeta(ed, m_lastMeta);
+    }
+    // se revisa ya mismo, sin esperar
+    m_settingsTimer = SETTINGS_INTERVAL;
+    this->checkSettings(0.f);
 }
 
 // ------------------------------------------------------------------ miembros, cursores y cubos
@@ -1099,7 +1272,9 @@ void Session::addMember(matjson::Value const& m) {
     member.accountID = (int)jnum(m, "accountID");
     member.username = jstr(m, "username");
     member.state = jstr(m, "state", "edit");
+    member.viewer = m.contains("viewer") && m["viewer"].asBool().unwrapOr(false);
     if (member.clientId.empty() || m_members.contains(member.clientId)) return;
+    if (member.clientId == Net::get().clientId()) m_viewer = member.viewer;
     member.color = this->nextColor();
     if (member.clientId != Net::get().clientId()) {
         member.cursor = makeCursorNode(member.username, member.color);
@@ -1112,6 +1287,7 @@ void Session::removeMember(std::string const& clientId) {
     if (it == m_members.end()) return;
     if (it->second.cursor) it->second.cursor->removeFromParent();
     if (it->second.ghost) it->second.ghost->removeFromParent();
+    if (it->second.selDraw) it->second.selDraw->removeFromParent();
     m_members.erase(it);
 }
 
@@ -1321,7 +1497,12 @@ void Session::sendStatus() {
 
 // ------------------------------------------------------------------ invitaciones
 
-void Session::removeInvite(std::string const& roomId) {
+void Session::removeInvite(std::string const& roomId, bool tellServer) {
+    if (tellServer && Net::get().isReady()) {
+        auto body = matjson::Value::object();
+        body["roomId"] = roomId;
+        Net::get().call("/invite/dismiss", std::move(body), nullptr);
+    }
     std::erase_if(m_inbox, [&](Invite const& i) { return i.roomId == roomId; });
     std::erase_if(m_alertQueue, [&](Invite const& i) { return i.roomId == roomId; });
     if (m_alert && m_alert->roomId == roomId) {
@@ -1395,6 +1576,7 @@ void Session::updateInviteAlert(float dt) {
 
 void Session::tick(float dt) {
     if (!m_initialized) return;
+    m_clock += dt;
     this->updateInviteAlert(dt);
 
     // los objetos borrados se sueltan después de un rato
@@ -1424,6 +1606,19 @@ void Session::tick(float dt) {
     if (!m_active) return;
 
     this->sendStatus();
+    if (m_conflictCooldown > 0.f) m_conflictCooldown -= dt;
+    if (m_viewerCooldown > 0.f) m_viewerCooldown -= dt;
+
+    // copia local: se guarda en el disco cada 15 s si cambió
+    m_cacheTimer += dt;
+    if (m_cacheTimer > 30.f) {
+        m_cacheTimer = 0.f;
+        this->saveCache(false);
+    }
+    if (m_reviveRetry >= 0.f) {
+        m_reviveRetry -= dt;
+        if (m_reviveRetry < 0.f && Net::get().isReady()) this->tryRevive();
+    }
 
     // pedir la copia de la sala (al volver al editor o después de un corte)
     if (m_needResync && !m_busy && Net::get().isReady()) {
@@ -1440,21 +1635,29 @@ void Session::tick(float dt) {
                 if (!m_active || room != m_roomId) return;
                 if (!res) {
                     auto err = res.unwrapErr();
-                    bool gone = err.find("no existe") != std::string::npos
-                        || err.find("invitación") != std::string::npos;
-                    if (gone || ++m_resyncFails > 6) {
+                    if (err.find("no existe") != std::string::npos) {
+                        // el servidor se reinició: se revive con tu copia
+                        this->tryRevive();
+                        return;
+                    }
+                    bool gone = err.find("invitación") != std::string::npos
+                        || err.find("otra sala") != std::string::npos;
+                    if (gone) {
                         FLAlertLayer::create("Collab",
                             "Se cerró la sala: " + err + "\nTus cambios siguen en tu nivel.", "OK")->show();
                         this->leave(false, "se perdió la sala");
                         return;
                     }
-                    // sin internet o el servidor despertando: se reintenta
+                    // sin internet o el servidor despertando: se reintenta (nunca te saca por esto)
                     m_needResync = true;
-                    m_resyncDelay = 3.f;
+                    m_resyncDelay = std::min(3.f * (1 + ++m_resyncFails), 20.f);
+                    if (m_resyncFails == 3) notify("Problemas de conexión, reintentando...", NotificationIcon::Warning);
                     return;
                 }
                 m_resyncFails = 0;
-                m_snapshotToApply = res.unwrap();
+                auto snap = res.unwrap();
+                this->cacheFromSnapshot(snap);
+                m_snapshotToApply = std::move(snap);
             }, 120);
         }
     }
@@ -1465,34 +1668,23 @@ void Session::tick(float dt) {
             // el editor puede tardar en aparecer en la escena; se espera un poco
             // antes de decidir que saliste (así no te saca por un parpadeo)
             m_exitTimer += dt;
-            float limit = (m_snapshotToApply || m_waitingSnapshot) ? 10.f : 1.5f;
+            float limit = (m_snapshotToApply || m_waitingSnapshot || m_job) ? 10.f : 1.5f;
             if (m_exitTimer > limit) this->detach(true);
         }
         return;
     }
     m_exitTimer = 0.f;
 
-    if (m_snapshotToApply) {
+    if (m_snapshotToApply && !m_job) {
         auto snap = std::move(*m_snapshotToApply);
         m_snapshotToApply.reset();
-        this->applySnapshot(snap, m_resyncRemoveUntracked);
+        this->startSnapshot(std::move(snap), m_resyncRemoveUntracked);
         m_resyncRemoveUntracked = false;
-        m_waitingSnapshot = false;
-        m_ownerId = jstr(snap, "owner", m_ownerId);
-        this->setMembers(jarr(snap, "members"));
-        for (auto const& c : jarr(snap, "cursors")) {
-            auto it = m_members.find(jstr(c, "from"));
-            if (it != m_members.end()) {
-                it->second.target = ccp(jnum(c, "x"), jnum(c, "y"));
-                it->second.hasCursor = true;
-            }
-        }
-        for (auto const& p : jarr(snap, "players")) this->onPlayerEvent(p);
-        m_sentState.clear();
-        notify("Estás en la sala colaborativa", NotificationIcon::Success);
-        auto early = std::move(m_earlyEvents);
-        m_earlyEvents.clear();
-        for (auto const& e : early) this->onEvent(e);
+    }
+    if (m_job) {
+        // niveles grandes se cargan de a poco para que el juego no se congele
+        if (!this->stepSnapshot()) return;
+        this->finishSnapshot();
     }
     if (m_waitingSnapshot) return;
 
@@ -1530,6 +1722,10 @@ void Session::tick(float dt) {
         this->flushOps();
     }
 
+    this->sendSelection(dt);
+    this->drawSelections(dt);
+    this->updateMarkers(dt);
+
     m_cursorTimer += dt;
     if (m_cursorTimer >= CURSOR_INTERVAL) {
         m_cursorTimer = 0.f;
@@ -1540,6 +1736,672 @@ void Session::tick(float dt) {
         this->updateCursorNode(m, dt);
         this->updateGhostNode(m, dt);
     }
+}
+
+// ------------------------------------------------------------------ copia local de la sala
+
+// Cada uno guarda en su PC una copia de la sala. Si el servidor se reinicia
+// y la sala se pierde, el primero que vuelve la revive con su copia.
+
+static std::filesystem::path cachePath() {
+    return Mod::get()->getSaveDir() / "room-cache.json";
+}
+
+void Session::cacheTouch() {
+    m_cacheSavedAt = nowMs();
+    m_cacheDirty = true;
+}
+
+void Session::cacheFromSnapshot(matjson::Value const& snap) {
+    m_cacheRoom = jstr(snap, "roomId", m_roomId);
+    m_cacheLevelName = jstr(snap, "levelName", m_levelName);
+    m_cacheHeader = jstr(snap, "header");
+    m_cacheMeta = jstr(snap, "meta");
+    m_cacheObjs.clear();
+    for (auto const& pair : jarr(snap, "objects")) {
+        if (!pair.isArray()) continue;
+        auto const& arr = pair.asArray().unwrap();
+        if (arr.size() < 2) continue;
+        m_cacheObjs[arr[0].asString().unwrapOr("")] = arr[1].asString().unwrapOr("");
+    }
+    m_cacheAllowed.clear();
+    for (auto const& a : jarr(snap, "allowed")) m_cacheAllowed.push_back((int)a.asInt().unwrapOr(0));
+    m_cacheViewers.clear();
+    for (auto const& m : jarr(snap, "members")) {
+        if (m.contains("viewer") && m["viewer"].asBool().unwrapOr(false)) {
+            m_cacheViewers.push_back((int)jnum(m, "accountID"));
+        }
+    }
+    // la conversación de la sala
+    if (snap.contains("chat")) {
+        m_chat.clear();
+        for (auto const& c : jarr(snap, "chat")) {
+            ChatMsg msg;
+            msg.from = jstr(c, "from");
+            msg.username = jstr(c, "username");
+            msg.text = jstr(c, "text");
+            m_chat.push_back(msg);
+        }
+    }
+    this->cacheTouch();
+}
+
+void Session::cacheApplyOps(std::vector<matjson::Value> const& ops) {
+    if (m_cacheRoom != m_roomId) return;
+    for (auto const& op : ops) {
+        auto t = jstr(op, "t");
+        auto id = jstr(op, "id");
+        if (t == "a" || t == "m") m_cacheObjs[id] = jstr(op, "s");
+        else if (t == "d") m_cacheObjs.erase(id);
+        else if (t == "h") m_cacheHeader = jstr(op, "s");
+        else if (t == "g") m_cacheMeta = jstr(op, "s");
+    }
+    this->cacheTouch();
+}
+
+static matjson::Value cacheToJson(std::string const& room, std::string const& level, std::string const& header,
+    std::string const& meta, std::unordered_map<std::string, std::string> const& objs,
+    std::vector<int> const& allowed, std::vector<int> const& viewers, int64_t savedAt) {
+    auto v = matjson::Value::object();
+    v["roomId"] = room;
+    v["levelName"] = level;
+    v["header"] = header;
+    v["meta"] = meta;
+    v["savedAt"] = (double)savedAt;
+    auto arr = matjson::Value::array();
+    for (auto const& [id, str] : objs) {
+        auto pair = matjson::Value::array();
+        pair.push(id);
+        pair.push(str);
+        arr.push(std::move(pair));
+    }
+    v["objects"] = std::move(arr);
+    auto al = matjson::Value::array();
+    for (int a : allowed) al.push(a);
+    v["allowed"] = std::move(al);
+    auto vw = matjson::Value::array();
+    for (int a : viewers) vw.push(a);
+    v["viewers"] = std::move(vw);
+    return v;
+}
+
+void Session::saveCache(bool now) {
+    if (!m_cacheDirty || m_cacheRoom.empty() || m_cacheRoom != m_roomId) return;
+    (void)now;
+    m_cacheDirty = false;
+    auto text = cacheToJson(m_cacheRoom, m_cacheLevelName, m_cacheHeader, m_cacheMeta, m_cacheObjs,
+        m_cacheAllowed, m_cacheViewers, m_cacheSavedAt).dump(matjson::NO_INDENTATION);
+    auto path = cachePath();
+    // se escribe aparte para no trabar el juego
+    std::thread([path, text = std::move(text)] {
+        auto tmp = path;
+        tmp += ".tmp";
+        {
+            std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+            if (!f) return;
+            f << text;
+        }
+        std::error_code ec;
+        std::filesystem::rename(tmp, path, ec);
+    }).detach();
+}
+
+std::optional<matjson::Value> Session::loadCache(std::string const& roomId) {
+    if (m_cacheRoom == roomId && !m_cacheObjs.empty()) {
+        return cacheToJson(m_cacheRoom, m_cacheLevelName, m_cacheHeader, m_cacheMeta, m_cacheObjs,
+            m_cacheAllowed, m_cacheViewers, m_cacheSavedAt);
+    }
+    auto text = geode::utils::file::readString(cachePath());
+    if (!text) return std::nullopt;
+    auto parsed = matjson::parse(text.unwrap());
+    if (!parsed) return std::nullopt;
+    auto v = parsed.unwrap();
+    if (jstr(v, "roomId") != roomId) return std::nullopt;
+    // se carga en memoria
+    m_cacheRoom = roomId;
+    m_cacheLevelName = jstr(v, "levelName");
+    m_cacheHeader = jstr(v, "header");
+    m_cacheMeta = jstr(v, "meta");
+    m_cacheSavedAt = (int64_t)jnum(v, "savedAt");
+    m_cacheObjs.clear();
+    for (auto const& pair : jarr(v, "objects")) {
+        if (!pair.isArray()) continue;
+        auto const& arr = pair.asArray().unwrap();
+        if (arr.size() < 2) continue;
+        m_cacheObjs[arr[0].asString().unwrapOr("")] = arr[1].asString().unwrapOr("");
+    }
+    m_cacheAllowed.clear();
+    for (auto const& a : jarr(v, "allowed")) m_cacheAllowed.push_back((int)a.asInt().unwrapOr(0));
+    m_cacheViewers.clear();
+    for (auto const& a : jarr(v, "viewers")) m_cacheViewers.push_back((int)a.asInt().unwrapOr(0));
+    return v;
+}
+
+void Session::clearCache() {
+    m_cacheRoom.clear();
+    m_cacheObjs.clear();
+    m_cacheHeader.clear();
+    m_cacheMeta.clear();
+    m_cacheAllowed.clear();
+    m_cacheViewers.clear();
+    m_cacheDirty = false;
+    std::error_code ec;
+    std::filesystem::remove(cachePath(), ec);
+}
+
+void Session::tryRevive() {
+    if (m_reviving) return;
+    auto roomId = m_roomId;
+    auto cache = this->loadCache(roomId);
+    if (!cache) {
+        bool wasActive = m_active;
+        this->leave(false, "la sala se perdió y no hay copia");
+        if (!wasActive) saveRoomInfo("", "");
+        if (wasActive) {
+            FLAlertLayer::create("Collab",
+                "La sala se cerró (el servidor se reinició).\nTus cambios siguen en tu copia del nivel.", "OK")->show();
+        }
+        return;
+    }
+    if (!Net::get().isReady()) {
+        m_reviveRetry = 3.f;
+        return;
+    }
+    m_reviving = true;
+    auto body = std::move(*cache);
+    body["state"] = this->myState();
+    log::info("Collab: reviviendo la sala {}", roomId);
+
+    Net::get().call("/room/revive", std::move(body), [this, roomId](JsonResult res) {
+        m_reviving = false;
+        if (m_roomId != roomId) return;
+        if (!res) {
+            auto err = res.unwrapErr();
+            if (err.find("conectar") != std::string::npos || err.find("servidor") != std::string::npos) {
+                m_reviveRetry = 5.f;
+                return;
+            }
+            bool wasActive = m_active;
+            this->leave(false, "no se pudo revivir: " + err);
+            if (!wasActive) {
+                saveRoomInfo("", "");
+                this->clearCache();
+            }
+            if (wasActive) FLAlertLayer::create("Collab", "No se pudo recuperar la sala: " + err, "OK")->show();
+            return;
+        }
+        auto snap = res.unwrap();
+        this->cacheFromSnapshot(snap);
+        if (!m_active) {
+            this->becomeAway(roomId, jstr(snap, "levelName", m_cacheLevelName), jstr(snap, "owner"), jarr(snap, "members"));
+        } else {
+            m_ownerId = jstr(snap, "owner", m_ownerId);
+            this->setMembers(jarr(snap, "members"));
+            if (m_editor) {
+                m_waitingSnapshot = true;
+                m_snapshotToApply = std::move(snap);
+            }
+        }
+        notify("La sala volvió (el servidor se había reiniciado)", NotificationIcon::Success);
+    }, 240);
+}
+
+void Session::handleKicked(std::string const& by) {
+    this->leave(false, "te sacaron de la sala");
+    FLAlertLayer::create("Collab",
+        fmt::format("<cy>{}</c> te sacó de la sala.\nTu copia del nivel sigue en tus niveles.", by.empty() ? "El anfitrión" : by),
+        "OK")->show();
+}
+
+// ------------------------------------------------------------------ cargar la sala por partes
+
+void Session::startSnapshot(matjson::Value snap, bool removeUntracked) {
+    auto ed = this->editor();
+    SnapJob job;
+    job.removeUntracked = removeUntracked;
+    if (ed) {
+        auto header = jstr(snap, "header");
+        if (!header.empty()) this->applyHeader(header);
+        auto meta = jstr(snap, "meta");
+        if (!meta.empty()) this->applyMeta(meta);
+        if (ed->m_objects) {
+            job.local.reserve(ed->m_objects->count());
+            for (auto obj : CCArrayExt<GameObject*>(ed->m_objects)) job.local.emplace_back(obj);
+        }
+    }
+    size_t count = snap.contains("objects") && snap["objects"].isArray()
+        ? snap["objects"].asArray().unwrap().size() : 0;
+    job.total = job.local.size() + count;
+    job.snap = std::move(snap);
+    m_job = std::move(job);
+    m_waitingSnapshot = true;
+    if (m_job->total > 6000) notify("Cargando la sala...");
+}
+
+int Session::loadingPercent() const {
+    if (!m_job) return -1;
+    return std::max(0, m_job->lastPct);
+}
+
+bool Session::stepSnapshot() {
+    auto ed = this->editor();
+    if (!ed) {
+        m_job.reset();
+        return false;
+    }
+    auto& job = *m_job;
+
+    if (job.phase == 0) {
+        size_t end = std::min(job.local.size(), job.index + LOAD_CHUNK);
+        for (; job.index < end; job.index++) {
+            auto obj = job.local[job.index].data();
+            if (!obj->getParent()) continue; // lo borraste mientras cargaba
+            if (!m_byPtr.contains(obj)) job.untracked.emplace(this->saveString(obj), obj);
+        }
+        if (job.index >= job.local.size()) {
+            job.phase = 1;
+            job.index = 0;
+        }
+    }
+    else if (job.phase == 1) {
+        if (!job.snap.contains("objects") || !job.snap["objects"].isArray()) {
+            job.phase = 2;
+        } else {
+            auto const& objs = job.snap["objects"].asArray().unwrap();
+            size_t end = std::min(objs.size(), job.index + LOAD_CHUNK);
+            std::vector<std::pair<std::string, std::string>> toCreate;
+            for (; job.index < end; job.index++) {
+                auto const& pair = objs[job.index];
+                if (!pair.isArray()) continue;
+                auto const& arr = pair.asArray().unwrap();
+                if (arr.size() < 2) continue;
+                auto id = arr[0].asString().unwrapOr("");
+                auto str = arr[1].asString().unwrapOr("");
+                if (id.empty()) continue;
+                job.keep.insert(id);
+
+                auto it = m_byId.find(id);
+                if (it != m_byId.end()) {
+                    auto ptr = it->second.data();
+                    auto pit = m_byPtr.find(ptr);
+                    if (pit != m_byPtr.end() && pit->second.str == str) continue;
+                    this->removeLocal(ptr);
+                }
+                auto uit = job.untracked.find(str);
+                if (uit != job.untracked.end()) {
+                    this->registerObject(id, uit->second, str);
+                    job.untracked.erase(uit);
+                    continue;
+                }
+                toCreate.emplace_back(std::move(id), std::move(str));
+            }
+            this->createBatch(toCreate);
+            if (job.index >= objs.size()) job.phase = 2;
+        }
+    }
+    else {
+        // lo que tú tenías y ya no existe en la sala
+        std::vector<GameObject*> remove;
+        for (auto& [id, obj] : m_byId) {
+            if (!job.keep.contains(id)) remove.push_back(obj.data());
+        }
+        if (job.removeUntracked) {
+            for (auto& [str, obj] : job.untracked) {
+                if (obj->getParent()) remove.push_back(obj);
+            }
+        }
+        for (auto obj : remove) this->removeLocal(obj);
+        this->purgeUndo();
+        m_pending.clear();
+        m_outOps.clear();
+        m_held.clear();
+        if (auto ui = ed->m_editorUI) {
+            ui->updateButtons();
+            ui->updateObjectInfoLabel();
+        }
+        return true;
+    }
+
+    // avance
+    size_t done = job.phase == 0 ? job.index : job.local.size() + job.index;
+    int pct = job.total ? (int)(done * 100 / job.total) : 100;
+    if (job.total > 6000 && pct / 25 != job.lastPct / 25 && pct < 100) {
+        notify(fmt::format("Cargando la sala... {}%", pct));
+    }
+    job.lastPct = pct;
+    return false;
+}
+
+void Session::finishSnapshot() {
+    auto snap = std::move(m_job->snap);
+    m_job.reset();
+    m_waitingSnapshot = false;
+    m_ownerId = jstr(snap, "owner", m_ownerId);
+    this->setMembers(jarr(snap, "members"));
+    for (auto const& c : jarr(snap, "cursors")) {
+        auto it = m_members.find(jstr(c, "from"));
+        if (it != m_members.end()) {
+            it->second.target = ccp(jnum(c, "x"), jnum(c, "y"));
+            it->second.hasCursor = true;
+        }
+    }
+    for (auto const& p : jarr(snap, "players")) this->onPlayerEvent(p);
+    for (auto const& sel : jarr(snap, "selects")) {
+        auto it = m_members.find(jstr(sel, "from"));
+        if (it == m_members.end()) continue;
+        for (auto const& id : jarr(sel, "ids")) {
+            if (id.isString()) it->second.selected.push_back(id.asString().unwrap());
+        }
+    }
+    for (auto& msg : m_chat) {
+        auto it = m_members.find(msg.from);
+        if (it != m_members.end()) msg.color = it->second.color;
+    }
+    m_sentState.clear();
+    m_selSig.clear();
+    notify(m_viewer ? "Estás en la sala (solo mirar)" : "Estás en la sala colaborativa", NotificationIcon::Success);
+    auto early = std::move(m_earlyEvents);
+    m_earlyEvents.clear();
+    for (auto const& e : early) this->onEvent(e);
+}
+
+// Crea muchos objetos de una vez (mucho más rápido que de uno en uno).
+void Session::createBatch(std::vector<std::pair<std::string, std::string>>& list) {
+    auto ed = this->editor();
+    if (!ed || list.empty()) return;
+    std::string joined;
+    for (auto const& [id, str] : list) {
+        if (str.empty()) continue;
+        joined += str;
+        joined += ';';
+    }
+    auto arr = ed->createObjectsFromString(joined, true, true);
+    size_t expected = std::count_if(list.begin(), list.end(), [](auto const& p) { return !p.second.empty(); });
+    if (arr && arr->count() == expected) {
+        size_t i = 0;
+        for (auto const& [id, str] : list) {
+            if (str.empty()) continue;
+            auto obj = static_cast<GameObject*>(arr->objectAtIndex(i++));
+            this->registerObject(id, obj, this->saveString(obj));
+        }
+    } else {
+        // no coincidió: se hace de uno en uno
+        if (arr) {
+            for (auto obj : CCArrayExt<GameObject*>(arr)) ed->removeObject(obj, true);
+        }
+        for (auto const& [id, str] : list) this->createLocal(id, str);
+    }
+    list.clear();
+}
+
+// Ctrl+Z: se quitan del historial los objetos que cambió otra persona,
+// así deshacer no revive cosas viejas ni las duplica.
+void Session::purgeUndo() {
+    if (m_removedForUndo.empty()) return;
+    auto ed = this->editor();
+    if (!ed) {
+        m_removedForUndo.clear();
+        return;
+    }
+    auto clean = [&](CCArray* list) {
+        if (!list) return;
+        for (int i = (int)list->count() - 1; i >= 0; i--) {
+            auto undo = typeinfo_cast<UndoObject*>(list->objectAtIndex(i));
+            if (!undo) continue;
+            bool bad = undo->m_objectCopy && m_removedForUndo.contains(undo->m_objectCopy->m_object);
+            if (!bad && undo->m_objects) {
+                for (auto obj : CCArrayExt<GameObject*>(undo->m_objects)) {
+                    if (m_removedForUndo.contains(obj)) {
+                        bad = true;
+                        break;
+                    }
+                }
+            }
+            if (bad) list->removeObjectAtIndex(i);
+        }
+    };
+    clean(ed->m_undoObjects);
+    clean(ed->m_redoObjects);
+    m_removedForUndo.clear();
+    if (auto ui = ed->m_editorUI) ui->updateButtons();
+}
+
+// ------------------------------------------------------------------ selección de cada uno
+
+void Session::updateSelection(std::unordered_set<GameObject*> const& selected) {
+    std::vector<std::string> ids;
+    for (auto obj : selected) {
+        auto it = m_byPtr.find(obj);
+        if (it != m_byPtr.end()) ids.push_back(it->second.id);
+        if (ids.size() >= MAX_SELECTION_SENT) break;
+    }
+    std::sort(ids.begin(), ids.end());
+    std::string sig;
+    for (auto const& id : ids) sig += id + ",";
+    if (sig == m_selSig) return;
+    m_selSig = sig;
+
+    // ¿alguien más tiene seleccionado lo mismo?
+    if (!ids.empty() && m_conflictCooldown <= 0.f) {
+        std::unordered_set<std::string> mine(ids.begin(), ids.end());
+        for (auto const& [cid, m] : m_members) {
+            if (cid == Net::get().clientId() || m.state != "edit") continue;
+            bool overlap = std::any_of(m.selected.begin(), m.selected.end(),
+                [&](std::string const& id) { return mine.contains(id); });
+            if (overlap) {
+                m_conflictCooldown = 6.f;
+                notify(fmt::format("{} también tiene seleccionado eso", m.username), NotificationIcon::Warning);
+                break;
+            }
+        }
+    }
+    m_selPending = std::move(ids);
+}
+
+void Session::sendSelection(float dt) {
+    m_selTimer += dt;
+    if (!m_selPending || m_selInFlight || m_selTimer < 0.25f || !Net::get().isReady()) return;
+    if (m_members.size() <= 1) {
+        m_selPending.reset();
+        return;
+    }
+    m_selTimer = 0.f;
+    auto ids = matjson::Value::array();
+    for (auto const& id : *m_selPending) ids.push(id);
+    m_selPending.reset();
+    auto body = matjson::Value::object();
+    body["ids"] = std::move(ids);
+    m_selInFlight = true;
+    Net::get().call("/room/select", std::move(body), [this](JsonResult) {
+        m_selInFlight = false;
+    });
+}
+
+void Session::drawSelections(float dt) {
+    m_selDrawTimer += dt;
+    if (m_selDrawTimer < 0.12f) return;
+    m_selDrawTimer = 0.f;
+    auto ed = this->editor();
+    if (!ed || !ed->m_objectLayer) return;
+    float scale = ed->m_objectLayer->getScale();
+    float line = scale > 0.0001f ? 1.3f / scale : 1.3f;
+
+    for (auto& [cid, m] : m_members) {
+        if (cid == Net::get().clientId()) continue;
+        if (m.selected.empty() || m.state != "edit") {
+            if (m.selDraw) m.selDraw->clear();
+            continue;
+        }
+        if (!m.selDraw) {
+            m.selDraw = CCDrawNode::create();
+            m.selDraw->setZOrder(99998);
+        }
+        if (m.selDraw->getParent() != ed->m_objectLayer) {
+            m.selDraw->removeFromParent();
+            ed->m_objectLayer->addChild(m.selDraw, 99998);
+        }
+        m.selDraw->clear();
+        auto c = m.color;
+        ccColor4F fill = { c.r / 255.f, c.g / 255.f, c.b / 255.f, 0.12f };
+        ccColor4F border = { c.r / 255.f, c.g / 255.f, c.b / 255.f, 0.95f };
+        size_t drawn = 0;
+        for (auto const& id : m.selected) {
+            if (drawn++ >= MAX_SELECTION_DRAWN) break;
+            auto it = m_byId.find(id);
+            if (it == m_byId.end()) continue;
+            auto rect = it->second->getObjectRect();
+            CCPoint verts[] = {
+                ccp(rect.getMinX(), rect.getMinY()), ccp(rect.getMaxX(), rect.getMinY()),
+                ccp(rect.getMaxX(), rect.getMaxY()), ccp(rect.getMinX(), rect.getMaxY()),
+            };
+            m.selDraw->drawPolygon(verts, 4, fill, line, border);
+        }
+    }
+}
+
+// ------------------------------------------------------------------ solo mirar
+
+void Session::viewerCheck(std::unordered_set<GameObject*> const& selected) {
+    auto ed = this->editor();
+    if (!ed || !ed->m_objects || m_viewerCooldown > 0.f) return;
+    bool changed = ed->m_objects->count() != m_byPtr.size();
+    if (!changed) {
+        for (auto obj : selected) {
+            auto it = m_byPtr.find(obj);
+            if (it == m_byPtr.end() || this->saveString(obj) != it->second.str) {
+                changed = true;
+                break;
+            }
+        }
+    }
+    if (!changed && !m_lastHeader.empty() && syncSettingsEnabled() && this->settingsString(ed) != m_lastHeader) {
+        changed = true;
+    }
+    if (!changed) return;
+    m_viewerCooldown = 3.f;
+    notify("Estás en modo solo mirar: tus cambios se deshacen", NotificationIcon::Warning);
+    this->requestSnapshot(true);
+}
+
+// ------------------------------------------------------------------ chat, marcas e ir a
+
+Member const* Session::member(std::string const& clientId) const {
+    auto it = m_members.find(clientId);
+    return it == m_members.end() ? nullptr : &it->second;
+}
+
+void Session::sendChat(std::string const& text, std::function<void(bool, std::string)> done) {
+    if (!m_active) {
+        done(false, "No estás en una sala.");
+        return;
+    }
+    auto body = matjson::Value::object();
+    body["text"] = text;
+    Net::get().call("/room/chat", std::move(body), [done](JsonResult res) {
+        done(res.isOk(), res ? "" : res.unwrapErr());
+    });
+}
+
+void Session::sendPing() {
+    auto ed = this->editor();
+    if (!ed || !ed->m_objectLayer) {
+        notify("Entra al nivel de la sala para marcar un lugar", NotificationIcon::Warning);
+        return;
+    }
+    auto pos = ed->m_objectLayer->convertToNodeSpace(CCDirector::get()->getWinSize() / 2.f);
+    auto body = matjson::Value::object();
+    body["x"] = std::round(pos.x);
+    body["y"] = std::round(pos.y);
+    Net::get().call("/room/ping", std::move(body), nullptr);
+}
+
+void Session::goToPoint(CCPoint pos) {
+    auto ed = this->editor();
+    if (!ed || !ed->m_objectLayer) return;
+    float scale = ed->m_objectLayer->getScale();
+    auto center = CCDirector::get()->getWinSize() / 2.f;
+    ed->m_objectLayer->setPosition(center - pos * scale);
+}
+
+bool Session::goToMember(std::string const& clientId) {
+    auto it = m_members.find(clientId);
+    if (it == m_members.end()) return false;
+    auto const& m = it->second;
+    if (m.ghostOn && m.state == "test" && m.ghost) {
+        this->goToPoint(m.ghostTarget);
+        return true;
+    }
+    if (m.hasCursor) {
+        this->goToPoint(m.target);
+        return true;
+    }
+    return false;
+}
+
+void Session::addMarker(CCPoint pos, std::string const& name, ccColor3B color) {
+    auto ed = this->editor();
+    if (!ed || !ed->m_objectLayer) return;
+    auto node = CCNode::create();
+    auto draw = CCDrawNode::create();
+    CCPoint tri[] = { ccp(0, 0), ccp(-10, 20), ccp(10, 20) };
+    ccColor4F fill = ccc4FFromccc3B(color);
+    draw->drawPolygon(tri, 3, fill, 1.5f, ccc4f(0, 0, 0, 1));
+    node->addChild(draw);
+    auto label = CCLabelBMFont::create(fmt::format("{}: mira aquí", name).c_str(), "chatFont.fnt");
+    label->setScale(0.6f);
+    label->setColor(color);
+    label->setPosition({0, 32});
+    node->addChild(label);
+    node->setPosition(pos);
+    ed->m_objectLayer->addChild(node, 100001);
+    m_markers.push_back(Marker{ Ref<CCNode>(node), 6.f });
+}
+
+void Session::updateMarkers(float dt) {
+    auto ed = this->editor();
+    float scale = ed && ed->m_objectLayer ? ed->m_objectLayer->getScale() : 1.f;
+    for (auto& mk : m_markers) {
+        mk.life -= dt;
+        if (!mk.node) continue;
+        if (scale > 0.0001f) mk.node->setScale(1.f / scale);
+        // rebota un poco y se desvanece al final
+        float bounce = std::abs(std::sin(mk.life * 6.f)) * 6.f;
+        if (auto draw = mk.node->getChildByType<CCDrawNode>(0)) draw->setPositionY(bounce);
+        if (mk.life < 1.f) mk.node->setVisible(std::fmod(mk.life, 0.2f) > 0.1f);
+        if (mk.life <= 0.f) mk.node->removeFromParent();
+    }
+    std::erase_if(m_markers, [](Marker const& mk) { return mk.life <= 0.f; });
+}
+
+// ------------------------------------------------------------------ anfitrión
+
+void Session::hostAction(std::string const& path, matjson::Value body, std::function<void(bool, std::string)> done) {
+    if (!isOwner()) {
+        done(false, "Solo el anfitrión puede hacer eso.");
+        return;
+    }
+    Net::get().call(path, std::move(body), [done](JsonResult res) {
+        done(res.isOk(), res ? "" : res.unwrapErr());
+    });
+}
+
+void Session::kick(std::string const& clientId, std::function<void(bool, std::string)> done) {
+    auto body = matjson::Value::object();
+    body["target"] = clientId;
+    this->hostAction("/room/kick", std::move(body), done);
+}
+
+void Session::makeOwner(std::string const& clientId, std::function<void(bool, std::string)> done) {
+    auto body = matjson::Value::object();
+    body["target"] = clientId;
+    this->hostAction("/room/owner", std::move(body), done);
+}
+
+void Session::setViewer(std::string const& clientId, bool viewer, std::function<void(bool, std::string)> done) {
+    auto body = matjson::Value::object();
+    body["target"] = clientId;
+    body["viewer"] = viewer;
+    this->hostAction("/room/role", std::move(body), done);
 }
 
 } // namespace collab
