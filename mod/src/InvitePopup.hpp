@@ -28,6 +28,7 @@ protected:
     void onStart(cocos2d::CCObject*);
     void onLeave(cocos2d::CCObject*);
     void buildMembers();
+    void onMember(cocos2d::CCObject* sender);
 
     // amigos
     void loadFriends();
