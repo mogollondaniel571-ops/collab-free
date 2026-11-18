@@ -18,8 +18,6 @@
 #include <Geode/utils/random.hpp>
 #include <Geode/utils/file.hpp>
 #include <chrono>
-#include <filesystem>
-#include <fstream>
 #include <thread>
 
 using namespace geode::prelude;
@@ -1743,7 +1741,7 @@ void Session::tick(float dt) {
 // Cada uno guarda en su PC una copia de la sala. Si el servidor se reinicia
 // y la sala se pierde, el primero que vuelve la revive con su copia.
 
-static std::filesystem::path cachePath() {
+static asp::fs::Path cachePath() {
     return Mod::get()->getSaveDir() / "room-cache.json";
 }
 
@@ -1833,16 +1831,8 @@ void Session::saveCache(bool now) {
         m_cacheAllowed, m_cacheViewers, m_cacheSavedAt).dump(matjson::NO_INDENTATION);
     auto path = cachePath();
     // se escribe aparte para no trabar el juego
-    std::thread([path, text = std::move(text)] {
-        auto tmp = path;
-        tmp += ".tmp";
-        {
-            std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-            if (!f) return;
-            f << text;
-        }
-        std::error_code ec;
-        std::filesystem::rename(tmp, path, ec);
+    std::thread([path = std::move(path), text = std::move(text)] {
+        (void)geode::utils::file::writeStringSafe(path, text);
     }).detach();
 }
 
@@ -1885,8 +1875,7 @@ void Session::clearCache() {
     m_cacheAllowed.clear();
     m_cacheViewers.clear();
     m_cacheDirty = false;
-    std::error_code ec;
-    std::filesystem::remove(cachePath(), ec);
+    (void)asp::fs::remove(cachePath());
 }
 
 void Session::tryRevive() {
