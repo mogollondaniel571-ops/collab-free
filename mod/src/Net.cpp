@@ -1,4 +1,5 @@
 #include "Net.hpp"
+#include <Geode/utils/random.hpp>
 
 #include <Geode/binding/GJAccountManager.hpp>
 
@@ -101,6 +102,15 @@ void Net::hello() {
     auto body = matjson::Value::object();
     body["accountID"] = am->m_accountID;
     body["username"] = std::string(am->m_username);
+    // llave secreta de este juego: protege tu cuenta para que nadie más la use
+    auto key = Mod::get()->getSavedValue<std::string>("account-key");
+    if (key.size() < 32) {
+        static const char* hex = "0123456789abcdef";
+        key.clear();
+        for (int i = 0; i < 40; i++) key += hex[geode::utils::random::generate<int>(0, 15)];
+        Mod::get()->setSavedValue<std::string>("account-key", key);
+    }
+    body["key"] = key;
 
     auto req = web::WebRequest();
     req.bodyJSON(body);
