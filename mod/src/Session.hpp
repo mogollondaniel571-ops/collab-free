@@ -41,6 +41,19 @@ struct Member {
     int ghostMode = -1;
     int ghostIconId = -1;
     float ghostAge = 0.f; // segundos desde la última posición
+
+    bool viewer = false;                        // solo puede mirar
+    std::vector<std::string> selected;          // ids de lo que tiene seleccionado
+    geode::Ref<cocos2d::CCDrawNode> selDraw;    // bordes de su selección
+};
+
+struct ChatMsg {
+    std::string from;
+    std::string username;
+    std::string text;
+    cocos2d::ccColor3B color = {255, 255, 255};
+    bool ping = false;           // "mira aquí"
+    cocos2d::CCPoint pos;        // dónde marcó
 };
 
 struct Invite {
@@ -87,10 +100,16 @@ public:
 
     // --- invitaciones guardadas
     std::vector<Invite> const& inbox() const { return m_inbox; }
-    void removeInvite(std::string const& roomId);
+    void removeInvite(std::string const& roomId, bool tellServer = false);
     /// La ventanita de invitación se cerró (aceptada o "más tarde").
     void alertClosed(std::string const& roomId, bool accepted);
     float alertTimeLeft() const { return m_alertLeft; }
+
+    /// Canción del nivel tal como está ahora (para la ventana de ajustes).
+    std::string metaNow(LevelEditorLayer* editor);
+    /// Se cerró la ventana de ajustes del nivel.
+    void settingsLayerClosed(LevelEditorLayer* editor, std::string const& metaBefore, bool songTouched, float openedAt);
+    float clock() const { return m_clock; }
 
     /// Antes de salir del editor: envía lo último que cambiaste.
     void beforeEditorExit(LevelEditorLayer* editor);
@@ -104,11 +123,60 @@ public:
     /// ¿Este nivel es el de tu sala?
     bool isRoomLevel(GJGameLevel* level) const;
 
+    // --- chat y marcas
+    std::deque<ChatMsg> const& chat() const { return m_chat; }
+    int unreadChat() const { return m_unread; }
+    void setChatOpen(bool open) { m_chatOpen = open; if (open) m_unread = 0; }
+    void sendChat(std::string const& text, std::function<void(bool, std::string)> done);
+    /// "Mira aquí": marca el centro de tu pantalla.
+    void sendPing();
+    /// Mueve tu cámara a donde está esa persona. false si no se sabe dónde está.
+    bool goToMember(std::string const& clientId);
+    void goToPoint(cocos2d::CCPoint pos);
+    Member const* member(std::string const& clientId) const;
+
+    // --- anfitrión
+    bool isViewer() const { return m_viewer; }
+    void kick(std::string const& clientId, std::function<void(bool, std::string)> done);
+    void makeOwner(std::string const& clientId, std::function<void(bool, std::string)> done);
+    void setViewer(std::string const& clientId, bool viewer, std::function<void(bool, std::string)> done);
+
+    /// 0..100 mientras se carga una sala grande, -1 si no.
+    int loadingPercent() const;
+
 private:
     void join(Invite const& invite);
     void onEvent(matjson::Value const& ev);
     void onHello(matjson::Value const& data, bool reconnect);
     void detach(bool notifyUser);
+    void becomeAway(std::string const& roomId, std::string const& levelName,
+        std::string const& owner, std::vector<matjson::Value> const& members);
+    void handleKicked(std::string const& by);
+
+    // copia local de la sala (para revivirla si el servidor se reinicia)
+    void cacheFromSnapshot(matjson::Value const& snap);
+    void cacheApplyOps(std::vector<matjson::Value> const& ops);
+    void cacheTouch();
+    void saveCache(bool now);
+    std::optional<matjson::Value> loadCache(std::string const& roomId);
+    void clearCache();
+    void tryRevive();
+
+    // cargar la sala por partes (niveles grandes)
+    void startSnapshot(matjson::Value snap, bool removeUntracked);
+    bool stepSnapshot();
+    void finishSnapshot();
+    void createBatch(std::vector<std::pair<std::string, std::string>>& list);
+    void purgeUndo();
+
+    // selección, marcas, solo mirar
+    void updateSelection(std::unordered_set<GameObject*> const& selected);
+    void sendSelection(float dt);
+    void drawSelections(float dt);
+    void addMarker(cocos2d::CCPoint pos, std::string const& name, cocos2d::ccColor3B color);
+    void updateMarkers(float dt);
+    void viewerCheck(std::unordered_set<GameObject*> const& selected);
+    void hostAction(std::string const& path, matjson::Value body, std::function<void(bool, std::string)> done);
 
     // sincronización de objetos
     std::string newObjectId();
@@ -117,8 +185,7 @@ private:
     void scan();
     void queueOp(char type, std::string const& id, std::string const* str);
     void flushOps();
-    void applyRemoteOps(std::vector<matjson::Value> const& ops);
-    void applySnapshot(matjson::Value const& snap, bool removeUntracked);
+    void applyRemoteOps(std::vector<matjson::Value> const& ops, std::string const& fromName = "");
     void requestSnapshot(bool removeUntracked);
     GameObject* createLocal(std::string const& id, std::string const& str);
     void removeLocal(GameObject* obj);
@@ -131,6 +198,7 @@ private:
     std::string metaString(LevelEditorLayer* ed);
     void applyHeader(std::string const& header);
     void applyMeta(std::string const& meta);
+    void restoreMeta(LevelEditorLayer* ed, std::string const& meta);
     void checkSettings(float dt);
 
     // miembros, cursores y cubos
@@ -224,10 +292,62 @@ private:
     geode::Ref<cocos2d::CCNode> m_alertNode;  // la ventanita (se vuelve a abrir si cambias de pantalla)
     std::string m_notifiedInvite;             // para no repetir el aviso
 
+    // chat y marcas
+    std::deque<ChatMsg> m_chat;
+    int m_unread = 0;
+    bool m_chatOpen = false;
+    struct Marker { geode::Ref<cocos2d::CCNode> node; float life = 0.f; };
+    std::vector<Marker> m_markers;
+
+    // selección
+    std::string m_selSig;
+    std::optional<std::vector<std::string>> m_selPending;
+    bool m_selInFlight = false;
+    float m_selTimer = 0.f;
+    float m_selDrawTimer = 0.f;
+    float m_conflictCooldown = 0.f;
+
+    // solo mirar
+    bool m_viewer = false;
+    float m_viewerCooldown = 0.f;
+
+    // objetos quitados por cambios de otros (se limpian del Ctrl+Z)
+    std::unordered_set<GameObject*> m_removedForUndo;
+
+    // carga por partes
+    struct SnapJob {
+        matjson::Value snap;
+        bool removeUntracked = false;
+        int phase = 0;
+        size_t index = 0;
+        std::vector<geode::Ref<GameObject>> local;
+        std::unordered_multimap<std::string, GameObject*> untracked;
+        std::unordered_set<std::string> keep;
+        size_t total = 0;
+        int lastPct = -1;
+    };
+    std::optional<SnapJob> m_job;
+
+    // copia local de la sala
+    std::string m_cacheRoom;
+    std::string m_cacheLevelName;
+    std::unordered_map<std::string, std::string> m_cacheObjs;
+    std::string m_cacheHeader;
+    std::string m_cacheMeta;
+    std::vector<int> m_cacheAllowed;
+    std::vector<int> m_cacheViewers;
+    int64_t m_cacheSavedAt = 0;
+    bool m_cacheDirty = false;
+    float m_cacheTimer = 0.f;
+    bool m_reviving = false;
+    float m_reviveRetry = -1.f;
+
     std::string m_lastHeader;  // ajustes del nivel enviados/recibidos
     std::string m_lastMeta;    // canción y efectos de sonido
     int m_bgIndex = -1, m_mgIndex = -1, m_groundIndex = -1, m_lineIndex = -1;
     float m_settingsTimer = 0.f;
+    float m_clock = 0.f;        // segundos desde que abriste el juego
+    float m_metaRemoteAt = -1.f;
     float m_exitTimer = 0.f;
 };
 
