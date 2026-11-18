@@ -1,4 +1,5 @@
 #include "InvitePopup.hpp"
+#include "RoomUI.hpp"
 #include "Net.hpp"
 #include "Session.hpp"
 
@@ -169,12 +170,17 @@ void InvitePopup::buildMembers() {
     auto list = s.members();
 
     std::string sig = s.ownerId();
-    for (auto m : list) sig += "|" + m->clientId + m->state;
+    for (auto m : list) sig += "|" + m->clientId + m->state + (m->viewer ? "v" : "");
     if (sig == m_membersSig) return;
     m_membersSig = sig;
 
     m_membersTitle->setString(fmt::format("En la sala ({}/6)", list.size()).c_str());
     m_membersList->removeAllChildren();
+    // cada fila se puede tocar para ver las opciones (ir a, anfitrión, sacar...)
+    auto rowMenu = CCMenu::create();
+    rowMenu->setContentSize({MEM_W, LIST_H});
+    rowMenu->setPosition({0, 0});
+    m_membersList->addChild(rowMenu, 10);
     for (size_t i = 0; i < list.size(); i++) {
         auto m = list[i];
         float y = LIST_H - MEM_ROW * (i + 0.5f) - 2.f;
@@ -195,7 +201,14 @@ void InvitePopup::buildMembers() {
         name->setPosition({20, y + 5});
         m_membersList->addChild(name);
 
-        auto stateStr = std::string(stateText(m->state)) + (owner ? " · anfitrión" : "");
+        auto stateStr = std::string(stateText(m->state)) + (owner ? " · anfitrión" : (m->viewer ? " · solo mira" : ""));
+
+        auto hit = CCLayerColor::create({255, 255, 255, 0}, MEM_W - 4.f, MEM_ROW - 2.f);
+        auto hitBtn = CCMenuItemSpriteExtra::create(hit, this, menu_selector(InvitePopup::onMember));
+        hitBtn->setUserObject(CCString::create(m->clientId));
+        hitBtn->m_scaleMultiplier = 1.f;
+        hitBtn->setPosition({MEM_W / 2, y});
+        rowMenu->addChild(hitBtn);
         auto state = CCLabelBMFont::create(stateStr.c_str(), "chatFont.fnt");
         state->setAnchorPoint({0, 0.5f});
         state->limitLabelWidth(MEM_W - 26.f, 0.42f, 0.2f);
@@ -204,6 +217,12 @@ void InvitePopup::buildMembers() {
         state->setPosition({20, y - 6});
         m_membersList->addChild(state);
     }
+}
+
+void InvitePopup::onMember(CCObject* sender) {
+    auto str = typeinfo_cast<CCString*>(static_cast<CCNode*>(sender)->getUserObject());
+    if (!str) return;
+    if (auto popup = MemberPopup::create(str->getCString())) popup->show();
 }
 
 void InvitePopup::refreshState() {
