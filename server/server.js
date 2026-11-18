@@ -318,8 +318,16 @@ const routes = {
             else if (!targetAccount && targetName && c.username.toLowerCase() === targetName) target = c;
         }
         if (!target) {
-            log(`invitación fallida de ${client.username}: ${targetAccount || targetName} no conectado`);
-            return [404, { error: "Ese jugador no tiene el mod abierto ahora." }];
+            if (targetAccount) {
+                // no está conectado: la invitación lo espera hasta que abra el juego
+                if (room.members.size >= MAX_MEMBERS) return [400, { error: "La sala está llena (máximo 6)." }];
+                room.allowed.add(targetAccount);
+                addInvite(targetAccount, { roomId: room.id, levelName: room.levelName, from: publicMember(client) });
+                log(`${client.username} invitó a ${targetAccount} (no conectado) a la sala ${room.id}`);
+                return [200, { ok: true, username: String(body.username || targetAccount), offline: true }];
+            }
+            log(`invitación fallida de ${client.username}: ${targetName} no conectado`);
+            return [404, { error: "Ese jugador no tiene el mod abierto ahora. Invítalo desde tu lista de amigos y le llegará al abrir el juego." }];
         }
         if (target.id === client.id) return [400, { error: "No te puedes invitar a ti mismo." }];
         if (room.members.has(target.id)) return [400, { error: "Ya está en la sala." }];
