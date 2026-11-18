@@ -14,6 +14,8 @@ const ROOM_EMPTY_TTL_MS = 10 * 60000;      // sala vacía y sin nadie por volver
 const ROOM_RETURN_TTL_MS = 24 * 3600000;   // sala con gente "por volver": hasta 24 h (mientras el servidor esté prendido)
 const MAX_BODY = 60 * 1024 * 1024;  // 60 MB (niveles grandes)
 const MAX_QUEUE = 20000;            // eventos pendientes por jugador
+const KEY_GRACE_MS = 10 * 60000;    // una cuenta con otra llave solo entra si la anterior lleva 10 min sin conectarse
+const KEEP_AWAKE_MS = 10 * 60000;   // se visita a sí mismo para que Render no lo duerma
 
 // ---------------------------------------------------------------- estado
 
@@ -21,6 +23,35 @@ const MAX_QUEUE = 20000;            // eventos pendientes por jugador
 const clients = new Map();
 /** roomId -> sala */
 const rooms = new Map();
+/** accountID -> { hash de la llave, última vez que se usó } (protege tu cuenta) */
+const accountKeys = new Map();
+/** accountID -> Map(roomId -> invitación) (se guardan aunque cierres el juego) */
+const pendingInvites = new Map();
+
+function hashKey(key) {
+    return crypto.createHash("sha256").update(String(key)).digest("hex");
+}
+
+function addInvite(accountID, invite) {
+    if (!pendingInvites.has(accountID)) pendingInvites.set(accountID, new Map());
+    pendingInvites.get(accountID).set(invite.roomId, invite);
+}
+
+function removeInvite(accountID, roomId) {
+    const map = pendingInvites.get(accountID);
+    if (map) map.delete(roomId);
+}
+
+function invitesFor(accountID) {
+    const map = pendingInvites.get(accountID);
+    if (!map) return [];
+    const list = [];
+    for (const [roomId, inv] of map) {
+        if (rooms.has(roomId)) list.push(inv);
+        else map.delete(roomId);
+    }
+    return list;
+}
 
 // registro de lo que pasa (para revisar problemas en /debug)
 const logLines = [];
@@ -119,8 +150,15 @@ function removeClient(client, explicit = false) {
 
 // ---------------------------------------------------------------- salas
 
-function publicMember(c) {
-    return { client: c.id, accountID: c.accountID, username: c.username, state: c.state || "edit" };
+function publicMember(c, room = null) {
+    const r = room || rooms.get(c.roomId);
+    return {
+        client: c.id,
+        accountID: c.accountID,
+        username: c.username,
+        state: c.state || "edit",
+        viewer: !!(r && r.viewers && r.viewers.has(c.accountID)),
+    };
 }
 
 function roomMembers(room) {
@@ -141,6 +179,10 @@ function leaveRoom(client, disconnected = false) {
     room.members.delete(client.id);
     room.cursors.delete(client.id);
     room.players.delete(client.id);
+    if (room.selects.has(client.id)) {
+        room.selects.delete(client.id);
+        broadcast(room, { type: "select", from: client.id, ids: [] });
+    }
     if (room.owner === client.id) {
         // el anfitrión se fue: el siguiente pasa a ser anfitrión
         const next = [...room.members][0];
@@ -163,7 +205,10 @@ function roomSnapshot(room) {
         meta: room.meta,
         objects: [...room.objects.entries()],
         owner: room.owner,
-        members: roomMembers(room).map(publicMember),
+        members: roomMembers(room).map((c) => publicMember(c, room)),
+        allowed: [...room.allowed],
+        chat: room.chat,
+        selects: [...room.selects.entries()].map(([from, ids]) => ({ from, ids })),
     };
 }
 
@@ -176,6 +221,20 @@ const routes = {
         const username = String(body.username || "").slice(0, 32);
         if (accountID <= 0 || !username) {
             return [400, { error: "Necesitas iniciar sesión en tu cuenta de Geometry Dash." }];
+        }
+        // protección: cada cuenta usa una llave secreta que solo tiene su juego
+        const key = String(body.key || "");
+        if (key.length >= 16) {
+            const hash = hashKey(key);
+            const known = accountKeys.get(accountID);
+            if (known && known.hash !== hash) {
+                const active = [...clients.values()].some((c) => c.accountID === accountID);
+                if (active || now() - known.lastUsed < KEY_GRACE_MS) {
+                    log(`llave incorrecta para ${username} (${accountID})`);
+                    return [403, { error: "Esta cuenta ya se está usando en otro dispositivo. Espera 10 minutos e intenta otra vez." }];
+                }
+            }
+            accountKeys.set(accountID, { hash, lastUsed: now() });
         }
         // si ya había una conexión vieja de esta cuenta, se reemplaza
         for (const c of [...clients.values()]) {
@@ -200,11 +259,11 @@ const routes = {
                 roomId: room.id,
                 levelName: room.levelName,
                 owner: room.owner,
-                members: roomMembers(room).map(publicMember),
+                members: roomMembers(room).map((c) => publicMember(c, room)),
             };
             break;
         }
-        return [200, { client: client.id, token: client.token, room: roomInfo }];
+        return [200, { client: client.id, token: client.token, room: roomInfo, invites: invitesFor(accountID) }];
     },
 
     // ¿cuáles de estas cuentas tienen el mod abierto ahora?
@@ -233,6 +292,10 @@ const routes = {
             meta: String(body.meta || ""),
             allowed: new Set([client.accountID]), // cuentas que pueden entrar
             returning: new Set(), // cuentas que se desconectaron sin salir
+            viewers: new Set(),   // cuentas que solo pueden mirar
+            chat: [],             // últimos mensajes
+            selects: new Map(),   // clientId -> ids seleccionados
+            savedAt: 0,           // de cuándo es la copia (al revivir la sala)
             emptySince: null,
         };
         for (const [id, str] of body.objects || []) {
@@ -262,6 +325,7 @@ const routes = {
         if (room.members.has(target.id)) return [400, { error: "Ya está en la sala." }];
         if (room.members.size >= MAX_MEMBERS) return [400, { error: "La sala está llena (máximo 6)." }];
         room.allowed.add(target.accountID);
+        addInvite(target.accountID, { roomId: room.id, levelName: room.levelName, from: publicMember(client) });
         const busy = !!(target.roomId && target.roomId !== room.id && rooms.has(target.roomId));
         log(`${client.username} invitó a ${target.username} a la sala ${room.id}${busy ? " (está en otra sala)" : ""}`);
         pushEvent(target, {
@@ -286,12 +350,13 @@ const routes = {
             return [400, { error: "Ya estás en otra sala. Sal de ella primero." }];
         }
         room.returning.delete(client.accountID);
+        removeInvite(client.accountID, room.id);
         room.members.add(client.id);
         room.emptySince = null;
         if (body.state) client.state = String(body.state);
         if (!room.owner) room.owner = client.id;
         client.roomId = room.id;
-        broadcast(room, { type: "join", member: publicMember(client) }, client.id);
+        broadcast(room, { type: "join", member: publicMember(client, room) }, client.id);
         log(`${client.username} entró a la sala ${room.id} (${room.members.size}/6)`);
         // se envían también los cursores actuales
         const snap = roomSnapshot(room);
@@ -311,6 +376,9 @@ const routes = {
     "/room/ops": (body, client) => {
         const room = rooms.get(client.roomId);
         if (!room) return [400, { error: "No estás en una sala." }];
+        if (room.viewers.has(client.accountID)) {
+            return [403, { error: "Estás en modo solo mirar." }];
+        }
         const ops = [];
         for (const op of body.ops || []) {
             const id = String(op.id || "");
@@ -382,10 +450,170 @@ const routes = {
         return [200, { ok: true }];
     },
 
+    // chat dentro del editor
+    "/room/chat": (body, client) => {
+        const room = rooms.get(client.roomId);
+        if (!room) return [400, { error: "No estás en una sala." }];
+        const text = String(body.text || "").replace(/[\r\n]+/g, " ").trim().slice(0, 200);
+        if (!text) return [400, { error: "Mensaje vacío." }];
+        const msg = { from: client.id, username: client.username, text, t: now() };
+        room.chat.push(msg);
+        if (room.chat.length > 60) room.chat.shift();
+        broadcast(room, { type: "chat", ...msg });
+        return [200, { ok: true }];
+    },
+
+    // "mira aquí": una flecha que ven todos
+    "/room/ping": (body, client) => {
+        const room = rooms.get(client.roomId);
+        if (!room) return [400, { error: "No estás en una sala." }];
+        broadcast(room, {
+            type: "ping",
+            from: client.id,
+            username: client.username,
+            x: Number(body.x) || 0,
+            y: Number(body.y) || 0,
+        });
+        return [200, { ok: true }];
+    },
+
+    // qué objetos tiene seleccionados cada uno
+    "/room/select": (body, client) => {
+        const room = rooms.get(client.roomId);
+        if (!room) return [400, { error: "No estás en una sala." }];
+        const ids = (Array.isArray(body.ids) ? body.ids : []).slice(0, 400).map(String);
+        if (ids.length) room.selects.set(client.id, ids);
+        else room.selects.delete(client.id);
+        broadcast(room, { type: "select", from: client.id, ids }, client.id);
+        return [200, { ok: true }];
+    },
+
+    // ---- controles del anfitrión
+    "/room/kick": (body, client) => {
+        const room = rooms.get(client.roomId);
+        if (!room) return [400, { error: "No estás en una sala." }];
+        if (room.owner !== client.id) return [403, { error: "Solo el anfitrión puede hacer eso." }];
+        const target = clients.get(String(body.target || ""));
+        if (!target || target.roomId !== room.id) return [404, { error: "Esa persona ya no está en la sala." }];
+        if (target.id === client.id) return [400, { error: "No te puedes sacar a ti mismo." }];
+        room.allowed.delete(target.accountID);
+        room.returning.delete(target.accountID);
+        room.viewers.delete(target.accountID);
+        removeInvite(target.accountID, room.id);
+        leaveRoom(target);
+        pushEvent(target, { type: "kicked", roomId: room.id, by: client.username });
+        log(`${client.username} sacó a ${target.username} de la sala ${room.id}`);
+        return [200, { ok: true }];
+    },
+
+    "/room/owner": (body, client) => {
+        const room = rooms.get(client.roomId);
+        if (!room) return [400, { error: "No estás en una sala." }];
+        if (room.owner !== client.id) return [403, { error: "Solo el anfitrión puede hacer eso." }];
+        const target = clients.get(String(body.target || ""));
+        if (!target || target.roomId !== room.id) return [404, { error: "Esa persona ya no está en la sala." }];
+        room.owner = target.id;
+        room.viewers.delete(target.accountID);
+        broadcast(room, { type: "owner", owner: target.id, member: publicMember(target, room) });
+        log(`${client.username} le pasó el mando a ${target.username} en la sala ${room.id}`);
+        return [200, { ok: true }];
+    },
+
+    "/room/role": (body, client) => {
+        const room = rooms.get(client.roomId);
+        if (!room) return [400, { error: "No estás en una sala." }];
+        if (room.owner !== client.id) return [403, { error: "Solo el anfitrión puede hacer eso." }];
+        const target = clients.get(String(body.target || ""));
+        if (!target || target.roomId !== room.id) return [404, { error: "Esa persona ya no está en la sala." }];
+        if (target.id === client.id) return [400, { error: "El anfitrión siempre puede editar." }];
+        if (body.viewer) room.viewers.add(target.accountID);
+        else room.viewers.delete(target.accountID);
+        broadcast(room, { type: "role", client: target.id, viewer: !!body.viewer });
+        return [200, { ok: true }];
+    },
+
+    // descartar una invitación guardada
+    "/invite/dismiss": (body, client) => {
+        removeInvite(client.accountID, String(body.roomId || ""));
+        return [200, { ok: true }];
+    },
+
+    // el servidor se reinició y la sala se perdió: alguien que estaba en ella la vuelve a crear
+    // con su copia guardada. Si llega una copia más nueva, reemplaza a la anterior.
+    "/room/revive": (body, client) => {
+        const roomId = String(body.roomId || "");
+        if (!roomId) return [400, { error: "Falta la sala." }];
+        const savedAt = Number(body.savedAt) || 0;
+        if (client.roomId && client.roomId !== roomId && rooms.has(client.roomId)) {
+            return [400, { error: "Ya estás en otra sala." }];
+        }
+        let room = rooms.get(roomId);
+        const allowed = (Array.isArray(body.allowed) ? body.allowed : []).map(Number).filter((n) => n > 0);
+        if (room) {
+            if (!room.allowed.has(client.accountID)) return [403, { error: "No tienes invitación a esa sala." }];
+            if (room.revived && savedAt > room.savedAt) {
+                // tu copia es más nueva: gana la tuya
+                room.header = String(body.header || room.header);
+                room.meta = String(body.meta || room.meta);
+                room.objects = new Map();
+                for (const [id, str] of body.objects || []) room.objects.set(String(id), String(str));
+                room.savedAt = savedAt;
+                broadcast(room, { type: "resync" }, client.id);
+                log(`sala ${roomId} actualizada con una copia más nueva de ${client.username}`);
+            }
+        } else {
+            if (!allowed.includes(client.accountID)) allowed.push(client.accountID);
+            room = {
+                id: roomId,
+                levelName: String(body.levelName || "Nivel").slice(0, 40),
+                header: String(body.header || ""),
+                objects: new Map(),
+                owner: null,
+                members: new Set(),
+                cursors: new Map(),
+                players: new Map(),
+                meta: String(body.meta || ""),
+                allowed: new Set(allowed),
+                returning: new Set(allowed.filter((a) => a !== client.accountID)),
+                viewers: new Set((Array.isArray(body.viewers) ? body.viewers : []).map(Number)),
+                chat: [],
+                selects: new Map(),
+                savedAt,
+                revived: true,
+                emptySince: null,
+            };
+            for (const [id, str] of body.objects || []) room.objects.set(String(id), String(str));
+            rooms.set(roomId, room);
+            log(`sala ${roomId} revivida por ${client.username} (${room.objects.size} objetos)`);
+            // los que ya están conectados y eran de la sala vuelven solos
+            for (const c of clients.values()) {
+                if (c !== client && !c.roomId && room.returning.has(c.accountID) && room.members.size < MAX_MEMBERS - 1) {
+                    room.returning.delete(c.accountID);
+                    c.state = "away";
+                    room.members.add(c.id);
+                    c.roomId = room.id;
+                    if (!room.owner) room.owner = c.id;
+                    pushEvent(c, { type: "revived", roomId: room.id, levelName: room.levelName });
+                }
+            }
+        }
+        room.returning.delete(client.accountID);
+        room.members.add(client.id);
+        room.emptySince = null;
+        if (!room.owner) room.owner = client.id;
+        if (body.state) client.state = String(body.state);
+        client.roomId = room.id;
+        broadcast(room, { type: "join", member: publicMember(client, room) }, client.id);
+        const snap = roomSnapshot(room);
+        snap.cursors = [];
+        snap.players = [];
+        return [200, snap];
+    },
+
     "/room/info": (body, client) => {
         const room = rooms.get(client.roomId);
         if (!room) return [200, { room: null }];
-        return [200, { room: { roomId: room.id, owner: room.owner, members: roomMembers(room).map(publicMember) } }];
+        return [200, { room: { roomId: room.id, owner: room.owner, members: roomMembers(room).map((c) => publicMember(c, room)) } }];
     },
 };
 
@@ -433,6 +661,11 @@ const server = http.createServer(async (req, res) => {
             objetos: r.objects.size,
         }));
         sendJson(res, 200, { conectados: online, salas: roomList, registro: logLines.slice(-80) });
+        return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/ping") {
+        sendJson(res, 200, { ok: true });
         return;
     }
 
@@ -536,6 +769,15 @@ setInterval(() => {
 server.keepAliveTimeout = 65000;
 server.headersTimeout = 66000;
 server.requestTimeout = 0;
+
+// Render duerme el servidor gratis si nadie lo visita en 15 min (y se pierden las salas).
+// Se visita a sí mismo cada 10 min para quedarse despierto.
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || process.env.SELF_URL || "";
+if (SELF_URL && typeof fetch === "function") {
+    setInterval(() => {
+        fetch(SELF_URL.replace(/\/$/, "") + "/ping").catch(() => {});
+    }, KEEP_AWAKE_MS);
+}
 
 server.listen(PORT, () => {
     console.log(`Collab Free escuchando en el puerto ${PORT}`);
