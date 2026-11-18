@@ -4,6 +4,6 @@
   "description": "Servidor de salas para el mod Collab Free de Geometry Dash",
   "main": "server.js",
   "scripts": { "start": "node server.js" },
-  "engines": { "node": ">=18" },
+  "engines": { "node": "22.x" },
   "license": "MIT"
 }
