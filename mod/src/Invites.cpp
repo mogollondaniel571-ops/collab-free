@@ -229,7 +229,7 @@ void InboxPopup::onJoin(CCObject* sender) {
 }
 
 void InboxPopup::onDelete(CCObject* sender) {
-    Session::get().removeInvite(roomOf(sender));
+    Session::get().removeInvite(roomOf(sender), true);
 }
 
 // ------------------------------------------------------------------ botón del sobre
